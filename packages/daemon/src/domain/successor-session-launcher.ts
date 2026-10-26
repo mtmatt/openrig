@@ -77,6 +77,9 @@ export type SuccessorLaunchResult =
       discoveredId: string;
       tmuxSession: string;
       tmuxPane: string;
+      /** The binding the successor's harness was launched and ready-checked with. A later startup
+       *  delivery to this same launch reuses it, since the adapter ties its readiness proof to it. */
+      launchBinding: NodeBinding;
       resumeToken?: string;
       resumeType?: string;
       appliedLaunch?: AppliedLaunchObservation;
@@ -292,6 +295,7 @@ export class SuccessorSessionLauncher {
       discoveredId: discovered.id,
       tmuxSession: departingSession,
       tmuxPane: pane.id,
+      launchBinding: started.binding,
       resumeToken: started.resumeToken,
       resumeType: started.resumeType,
       appliedLaunch: started.appliedLaunch,
@@ -313,7 +317,7 @@ export class SuccessorSessionLauncher {
     cwd: string | undefined,
     forkSource?: ForkSource,
     launchGeneration?: string | null,
-  ): Promise<{ ok: true; resumeToken?: string; resumeType?: string; appliedLaunch?: AppliedLaunchObservation } | { ok: false; code: string; message: string }> {
+  ): Promise<{ ok: true; binding: NodeBinding; resumeToken?: string; resumeType?: string; appliedLaunch?: AppliedLaunchObservation } | { ok: false; code: string; message: string }> {
     const adapter = node.runtime ? this.runtimeAdapters[node.runtime] : undefined;
     if (!adapter) {
       return {
@@ -401,7 +405,7 @@ export class SuccessorSessionLauncher {
       };
     }
 
-    return { ok: true, resumeToken, resumeType, appliedLaunch: launch.appliedLaunch };
+    return { ok: true, binding, resumeToken, resumeType, appliedLaunch: launch.appliedLaunch };
   }
 
   /**

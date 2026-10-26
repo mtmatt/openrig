@@ -449,6 +449,53 @@ describe("SeatHandoverService source execution (OPR.0.5.5.5)", () => {
     expect(respawnPane).toHaveBeenCalledTimes(2);
   });
 
+  // A composer-launched successor takes over its predecessor's pane, so the tmux session keeps its owner.
+  function liveSessionOrigin(nodeId: string) {
+    const row = db.prepare("SELECT origin FROM sessions WHERE node_id = ? AND status NOT IN ('superseded', 'detached', 'exited') ORDER BY id DESC").get(nodeId) as { origin: string } | undefined;
+    return row?.origin;
+  }
+  function lifecycleService(): SeatLifecycleService {
+    const probeSession = vi.fn(async () => ({ state: "present" as const }));
+    return new SeatLifecycleService({ db, rigRepo, sessionRegistry, eventBus,
+      tmuxAdapter: { ...tmux(), probeSession } as unknown as TmuxAdapter,
+      nodeLauncher: {} as never, startupOrchestrator: {} as never, runtimeAdapters: { codex: codexAdapter() } });
+  }
+
+  it.each(["fresh", "fork:dev-impl@seat-rig", "rebuild"])("--source %s keeps an OpenRig-launched seat OpenRig-managed, so rig seat stop still acts on it", async (source) => {
+    const { node } = seedSeat({ resumeToken: "native-abc" });
+
+    const result = await service.handover({ seatRef: "dev-impl@seat-rig", reason: "context-wall", source });
+
+    expect(result).toMatchObject({ ok: true });
+    expect(liveSessionOrigin(node.id)).toBe("launched");
+    expect(await lifecycleService().stopSeat({ seatRef: "dev-impl@seat-rig", reason: "relaunch" })).toMatchObject({ ok: true });
+    expect(killSession).toHaveBeenCalledWith("dev-impl@seat-rig");
+  });
+
+  it("after a rebuild handover, a fresh launch with --stop plans to stop the successor instead of refusing it as adopted", async () => {
+    const { node } = seedSeat();
+    db.prepare(`INSERT INTO node_startup_context
+      (node_id, projection_entries_json, resolved_files_json, startup_actions_json, runtime)
+      VALUES (?, '[]', '[]', '[]', 'codex')`).run(node.id);
+    expect(await service.handover({ seatRef: "dev-impl@seat-rig", reason: "context-wall", source: "rebuild" })).toMatchObject({ ok: true });
+
+    const plan = await lifecycleService().planFresh({ seatRef: "dev-impl@seat-rig", fresh: true, stop: true });
+
+    expect(plan).toMatchObject({ ok: true, launchable: true, wouldStop: true, blockers: [] });
+  });
+
+  it("an adopted seat stays adopted after a composer handover", async () => {
+    const rig = rigRepo.createRig("seat-rig");
+    const node = rigRepo.addNode(rig.id, "dev.impl", { runtime: "codex", cwd: "/project" });
+    sessionRegistry.registerClaimedSession(node.id, "dev-impl@seat-rig");
+    sessionRegistry.updateBinding(node.id, { tmuxSession: "dev-impl@seat-rig", tmuxPane: "%0" });
+
+    const result = await service.handover({ seatRef: "dev-impl@seat-rig", reason: "context-wall", source: "rebuild" });
+
+    expect(result).toMatchObject({ ok: true });
+    expect(liveSessionOrigin(node.id)).toBe("claimed");
+  });
+
   it("a seat-pane discovery row claimed by another node still refuses the handover (#237 holds)", async () => {
     const { rig, node, sessionId } = seedSeat();
     const other = rigRepo.addNode(rig.id, "dev.other", { runtime: "codex", cwd: "/project" });

@@ -8,7 +8,7 @@ import { isClaudeResumeType } from "../adapters/claude-resume.js";
 import type { StartupAction, StartupProofSelection, StartupFailureStage } from "./types.js";
 import type {
   RuntimeAdapter, NodeBinding, ResolvedStartupFile,
-  ProjectionResult, StartupDeliveryResult, ForkSource,
+  StartupDeliveryResult, ForkSource,
 } from "./runtime-adapter.js";
 import { isAttentionRequiredReadinessCode, resolveConcreteHint } from "./runtime-adapter.js";
 import type { ProjectionPlan } from "./projection-planner.js";
@@ -304,14 +304,7 @@ export class StartupOrchestrator {
     } catch (error) {
       return this.fail(input, "failed", [`Permission selection: ${(error as Error).message}`], undefined, false, undefined, false, "permission_selection", true);
     }
-    // #25: launch, restore replay, relaunch, continue and added members deliver
-    // guidance through here, so the rig's managed-block destination is bound once
-    // for the adapter. Handover does not come here: the successor launches directly
-    // and reads the file already written in its cwd.
-    const rigRepo = new RigRepository(this.db);
-    input = { ...input, binding: { ...input.binding, nonInterruptive: rigRepo.getRigNonInterruptive(input.rigId) } };
-    const claudeManagedBlockFile = rigRepo.getRigClaudeManagedBlockFile(input.rigId);
-    if (claudeManagedBlockFile) input = { ...input, binding: { ...input.binding, claudeManagedBlockFile } };
+    input = { ...input, binding: this.withRigDeliverySettings(input.rigId, input.binding) };
     const deliveryInput: StartupDeliveryInput = { ...input, warnings, submissionWarnings: [], startupAttemptId: randomUUID(), sendOrder: 0, submissionDiagnostics: [] };
     const errors: string[] = [];
     let continuityOutcome: "resumed" | "fresh" | "forked" | "rebuilt" = input.resumeToken
@@ -338,65 +331,12 @@ export class StartupOrchestrator {
     }
     this.eventBus.emit({ type: "node.startup_pending", rigId: input.rigId, nodeId: input.nodeId, startupProof });
 
-    // 2. Project resources. A contained Claude resume has an intentionally empty
-    // replay plan, not a newly selected profile with activity hooks removed.
-    // RestoreOrchestrator already reconciled the saved activity selection before
-    // native resume. Fresh launches still project empty plans to support removal.
-    let projectionResult: ProjectionResult;
-    if (!(input.preserveStartupContext && input.adapter.runtime === "claude-code" && input.plan.entries.length === 0)) try {
-      projectionResult = await input.adapter.project(input.plan, input.binding);
-      warnings.push(...(projectionResult.warnings ?? []));
-      if (projectionResult.failed.length > 0) {
-        for (const f of projectionResult.failed) {
-          errors.push(`Projection failed for ${f.effectiveId}: ${f.error}`);
-        }
-        return this.fail(input, "failed", errors, undefined, false, undefined, false, "projection", true);
-      }
-    } catch (err) {
-      errors.push(`Projection error: ${(err as Error).message}`);
-      return this.fail(input, "failed", errors, undefined, false, undefined, false, "projection", true);
+    // 2-4. Project resources and deliver the pre-launch (filesystem) startup files.
+    const filesystemStartup = await this.deliverFilesystemStartup(input, context, warnings);
+    if (!filesystemStartup.ok) {
+      return this.fail(input, "failed", filesystemStartup.errors, undefined, false, undefined, false, filesystemStartup.stage, true);
     }
-
-    // 3. Partition startup files by concrete hint: pre-launch (filesystem) vs post-launch (TUI)
-    // Note: new file-building paths (NS-T05+) emit only concrete hints. The auto fallback
-    // is compatibility-only for pre-NS-T05 persisted startup contexts in node_startup_context.
-    //
-    // Rebuild-mode artifacts (when set) are merged in front of resolvedStartupFiles
-    // so the operator's trust-precedence ordering is preserved when the post-launch
-    // delivery loop walks the array. Rebuild artifacts are tagged
-    // appliesOn: ["fresh_start"] by the resolver, which matches the rebuild context.
-    const sourceFiles = input.rebuildArtifacts && input.rebuildArtifacts.length > 0
-      ? [...input.rebuildArtifacts, ...input.resolvedStartupFiles]
-      : input.resolvedStartupFiles;
-    const applicableFiles = sourceFiles.filter((f) => f.appliesOn.includes(context));
-    const preLaunchFiles: ResolvedStartupFile[] = [];
-    let postLaunchFiles: ResolvedStartupFile[] = [];
-    for (const f of applicableFiles) {
-      const hint = f.deliveryHint === "auto"
-        ? resolveConcreteHint(f.path, this.safeReadFile(f.absolutePath))
-        : f.deliveryHint;
-      if (hint === "send_text") {
-        postLaunchFiles.push(f);
-      } else {
-        preLaunchFiles.push(f);
-      }
-    }
-
-    // 4. Deliver pre-launch files (filesystem: guidance_merge, skill_install)
-    // Always call even with empty list so adapters can provision runtime-specific config (e.g. context collectors)
-    try {
-      const deliveryResult = await input.adapter.deliverStartup(preLaunchFiles, input.binding);
-      warnings.push(...(deliveryResult.warnings ?? []));
-      if (deliveryResult.failed.length > 0) {
-        for (const f of deliveryResult.failed) {
-          errors.push(`Pre-launch file delivery failed: ${f.path}: ${f.error}`);
-        }
-        return this.fail(input, "failed", errors, undefined, false, undefined, false, "pre_launch_files", true);
-      }
-    } catch (err) {
-      errors.push(`Pre-launch delivery error: ${(err as Error).message}`);
-      return this.fail(input, "failed", errors, undefined, false, undefined, false, "pre_launch_files", true);
-    }
+    let postLaunchFiles = filesystemStartup.postLaunchFiles;
 
     // 7. Persist startup context for restore replay
     if (!input.preserveStartupContext) try {
@@ -755,6 +695,102 @@ export class StartupOrchestrator {
     this.eventBus.emit({ type: "node.startup_ready", rigId: input.rigId, nodeId: input.nodeId, ...(submission ? { submission } : {}) });
 
     return { ok: true, startupStatus: "ready", continuityOutcome, ...(submission ? { submission } : {}) };
+  }
+
+  /**
+   * The filesystem part of a fresh start, for a harness that another path launches: the binding gets the
+   * seat's permission selection and the rig's delivery settings, the plan's resources are projected and
+   * the pre-launch startup files delivered (guidance merged into the managed block, skills installed), as
+   * startNode does before it launches a harness. A rebuild handover calls this before its successor
+   * starts, so the successor reads the seat's current guidance; the startNode that later finishes the
+   * successor's startup repeats these idempotent writes. No startup status or event is recorded.
+   */
+  async deliverPreLaunchFiles(
+    input: Pick<StartupInput, "rigId" | "binding" | "adapter" | "plan" | "resolvedStartupFiles">,
+  ): Promise<{ ok: true; warnings: string[] } | { ok: false; errors: string[] }> {
+    let binding: NodeBinding;
+    try {
+      binding = new NativePermissionStore(this.db).apply(input.binding, input.adapter.runtime);
+    } catch (error) {
+      return { ok: false, errors: [`Permission selection: ${(error as Error).message}`] };
+    }
+    binding = this.withRigDeliverySettings(input.rigId, binding);
+    const warnings: string[] = [];
+    const delivered = await this.deliverFilesystemStartup({ ...input, binding }, "fresh_start", warnings);
+    return delivered.ok ? { ok: true, warnings } : { ok: false, errors: delivered.errors };
+  }
+
+  /** #25: launch, restore replay, relaunch, continue, added members and a rebuild handover's successor
+   *  deliver guidance through the orchestrator, so the rig's managed-block destination (and its
+   *  non-interruptive setting) is bound here once for the adapter. Fresh and fork handovers do not come
+   *  here: their successor launches directly and reads the file already written in its cwd. */
+  private withRigDeliverySettings(rigId: string, binding: NodeBinding): NodeBinding {
+    const rigRepo = new RigRepository(this.db);
+    const claudeManagedBlockFile = rigRepo.getRigClaudeManagedBlockFile(rigId);
+    return { ...binding, nonInterruptive: rigRepo.getRigNonInterruptive(rigId), ...(claudeManagedBlockFile ? { claudeManagedBlockFile } : {}) };
+  }
+
+  /**
+   * Steps 2-4 of startNode, shared with deliverPreLaunchFiles: project the plan's resources, partition the
+   * startup files that apply in `context`, and deliver the pre-launch (filesystem) ones. Returns the
+   * post-launch files to send once the harness is ready, or the stage that failed with its errors.
+   */
+  private async deliverFilesystemStartup(
+    input: Pick<StartupInput, "adapter" | "binding" | "plan" | "resolvedStartupFiles" | "rebuildArtifacts" | "preserveStartupContext">,
+    context: "fresh_start" | "restore",
+    warnings: string[],
+  ): Promise<{ ok: true; postLaunchFiles: ResolvedStartupFile[] } | { ok: false; stage: "projection" | "pre_launch_files"; errors: string[] }> {
+    // 2. Project resources. A contained Claude resume has an intentionally empty
+    // replay plan, not a newly selected profile with activity hooks removed.
+    // RestoreOrchestrator already reconciled the saved activity selection before
+    // native resume. Fresh launches still project empty plans to support removal.
+    if (!(input.preserveStartupContext && input.adapter.runtime === "claude-code" && input.plan.entries.length === 0)) try {
+      const projectionResult = await input.adapter.project(input.plan, input.binding);
+      warnings.push(...(projectionResult.warnings ?? []));
+      if (projectionResult.failed.length > 0) {
+        return { ok: false, stage: "projection", errors: projectionResult.failed.map((f) => `Projection failed for ${f.effectiveId}: ${f.error}`) };
+      }
+    } catch (err) {
+      return { ok: false, stage: "projection", errors: [`Projection error: ${(err as Error).message}`] };
+    }
+
+    // 3. Partition startup files by concrete hint: pre-launch (filesystem) vs post-launch (TUI)
+    // Note: new file-building paths (NS-T05+) emit only concrete hints. The auto fallback
+    // is compatibility-only for pre-NS-T05 persisted startup contexts in node_startup_context.
+    //
+    // Rebuild-mode artifacts (when set) are merged in front of resolvedStartupFiles
+    // so the operator's trust-precedence ordering is preserved when the post-launch
+    // delivery loop walks the array. Rebuild artifacts are tagged
+    // appliesOn: ["fresh_start"] by the resolver, which matches the rebuild context.
+    const sourceFiles = input.rebuildArtifacts && input.rebuildArtifacts.length > 0
+      ? [...input.rebuildArtifacts, ...input.resolvedStartupFiles]
+      : input.resolvedStartupFiles;
+    const applicableFiles = sourceFiles.filter((f) => f.appliesOn.includes(context));
+    const preLaunchFiles: ResolvedStartupFile[] = [];
+    const postLaunchFiles: ResolvedStartupFile[] = [];
+    for (const f of applicableFiles) {
+      const hint = f.deliveryHint === "auto"
+        ? resolveConcreteHint(f.path, this.safeReadFile(f.absolutePath))
+        : f.deliveryHint;
+      if (hint === "send_text") {
+        postLaunchFiles.push(f);
+      } else {
+        preLaunchFiles.push(f);
+      }
+    }
+
+    // 4. Deliver pre-launch files (filesystem: guidance_merge, skill_install)
+    // Always call even with empty list so adapters can provision runtime-specific config (e.g. context collectors)
+    try {
+      const deliveryResult = await input.adapter.deliverStartup(preLaunchFiles, input.binding);
+      warnings.push(...(deliveryResult.warnings ?? []));
+      if (deliveryResult.failed.length > 0) {
+        return { ok: false, stage: "pre_launch_files", errors: deliveryResult.failed.map((f) => `Pre-launch file delivery failed: ${f.path}: ${f.error}`) };
+      }
+    } catch (err) {
+      return { ok: false, stage: "pre_launch_files", errors: [`Pre-launch delivery error: ${(err as Error).message}`] };
+    }
+    return { ok: true, postLaunchFiles };
   }
 
   /** A failed attempt can continue only when it stopped before sending context.

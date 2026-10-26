@@ -133,7 +133,7 @@ export const SEAT_HANDOVER_SOURCE_CAPABILITIES: Record<SeatHandoverSourceMode, {
   fresh: { executes: true, contextCarrier: "captured restore packet pasted to the fresh successor before commit" },
   discovered: { executes: true, contextCarrier: "operator-prepared successor; nothing is delivered" },
   fork: { executes: true, contextCarrier: "native fork of the resolved source conversation (the successor carries the incumbent context from its first byte; commit persists the NEW post-fork token)" },
-  rebuild: { executes: true, contextCarrier: "durable artifact chain (authored recap / LEARNED / restore record) delivered as a priming packet; the executed set and its gaps are recorded" },
+  rebuild: { executes: true, contextCarrier: "the seat's startup context (identity, role, guidance) delivered as a fresh launch delivers it, then the durable artifact chain (authored recap / LEARNED / restore record) as a priming packet; the executed set and its gaps are recorded" },
 };
 
 export function parseHandoverSource(source?: string | null): { ok: true; source: SeatHandoverSource } | { ok: false; code: "invalid_source"; message: string; guidance: string } {

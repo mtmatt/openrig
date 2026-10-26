@@ -16,7 +16,7 @@ import { existsSync } from "node:fs";
 import { SuccessorSessionLauncher } from "./successor-session-launcher.js";
 import { deriveResumeToken, type ResumeTokenCaptureDeps } from "./resume-token-capture.js";
 import { validateResumeToken } from "./resume-token-validation.js";
-import type { RuntimeAdapter } from "./runtime-adapter.js";
+import type { NodeBinding, RuntimeAdapter } from "./runtime-adapter.js";
 import type { OccupantInvalidator } from "./occupant-invalidator.js";
 import type { JsonlExchange } from "./session-jsonl.js";
 import type { PersistedEvent } from "./types.js";
@@ -24,6 +24,8 @@ import type { AppliedLaunchObservation } from "./permission-drift.js";
 import { AppliedLaunchObservationStore } from "./applied-launch-observation-store.js";
 import { findOtherSessionOwner } from "./session-owner.js";
 import { seatCorePluginDir, withCorePlugin } from "./claude-core-plugin-env.js";
+import { readPersistedStartupContext, type PersistedStartupContext } from "./persisted-startup-context.js";
+import type { StartupOrchestrator, StartupResult } from "./startup-orchestrator.js";
 
 /** A bounded labeled-from-record recap of the predecessor's last exchanges + the record path,
  *  resolved from the predecessor's provider transcript (claude transcript_path / codex rollout_path).
@@ -76,12 +78,19 @@ export interface SeatHandoverMutationResult {
     provenanceRecordWritten: false;
   };
   /** OPR.0.5.5.5 — per-source execution outcome. fork: the resolved fork origin;
-   *  rebuild: EXACTLY which durable artifacts primed the successor, which
-   *  declared addresses were gaps, and (when the chain is empty) the named
-   *  reason — recorded, never silently dropped. Absent for fresh/discovered. */
+   *  rebuild: EXACTLY which durable artifacts make up the successor's priming
+   *  packet, which declared addresses were gaps, and (when the chain is empty)
+   *  the named reason — recorded, never silently dropped. Recorded at commit,
+   *  on the seat.handover_completed event too; `primingNotDelivered` says when
+   *  the packet was then not sent. Absent for fresh/discovered. */
   sourceOutcome?:
     | { mode: "fork"; forkedFrom: string; forkId?: "captured" | "pending"; limit?: string }
     | { mode: "rebuild"; primedArtifacts: Array<{ address: string; label: string }>; gaps: string[]; emptyChainReason?: string };
+  /** Rebuild only: the seat's configured startup context (identity, role, guidance), delivered to the
+   *  successor as a fresh launch delivers it and before the priming packet. `skipped` says why none was. */
+  startup?: { status: "ready" | "attention_required" | "failed" | "skipped"; detail?: string; warnings?: string[] };
+  /** Rebuild only: why the priming packet was not sent after commit. */
+  primingNotDelivered?: string;
 }
 
 export type SeatHandoverResult =
@@ -90,7 +99,7 @@ export type SeatHandoverResult =
   | { ok: false; code: "missing_reason" | "invalid_source" | "successor_creation_not_implemented" | "source_not_supported" | "resume_token_unavailable" | "fork_source_not_found"; message: string; guidance: string }
   | { ok: false; code: "current_occupant_required" | "discovered_not_active" | "successor_tmux_absent" | "successor_already_managed" | "successor_is_current" | "runtime_mismatch"; message: string; guidance: string }
   | { ok: false; code: "discovered_not_found"; message: string; guidance: string }
-  | { ok: false; code: "tmux_probe_failed" | "handover_commit_failed" | "successor_create_failed" | "context_delivery_failed"; message: string; guidance: string }
+  | { ok: false; code: "tmux_probe_failed" | "handover_commit_failed" | "successor_create_failed" | "context_delivery_failed" | "startup_context_failed"; message: string; guidance: string }
   | Extract<SeatStatusResult, { ok: false }>;
 
 interface NodeRow {
@@ -112,6 +121,31 @@ interface SessionRow {
   id: string;
   session_name: string;
   status: string;
+  origin: string;
+}
+
+/** What a rebuild replays to its successor: the seat's persisted startup context, through its runtime adapter. */
+interface RebuildStartup {
+  orchestrator: StartupOrchestrator;
+  adapter: RuntimeAdapter;
+  context: PersistedStartupContext;
+  /** Warnings from writing the startup files before the successor started. */
+  warnings: string[];
+}
+
+type RebuildStartupPreparation =
+  | { ok: true; replay: RebuildStartup }
+  | { ok: true; skipped: string }
+  | { ok: false; refusal: SeatHandoverResult };
+
+/** The rebuild priming packet's contents (see deliverRebuildPrimingPacket). */
+interface RebuildPriming {
+  seatRef: string;
+  reason: string;
+  departingSession: string;
+  primedArtifacts: Array<{ address: string; label: string }>;
+  gaps: string[];
+  emptyChainReason?: string;
 }
 
 interface BindingOwnerRow {
@@ -204,6 +238,12 @@ interface SeatHandoverServiceDeps {
    *  (the session-source-rebuild-resolver seam). Default: node:fs existsSync;
    *  tests inject. */
   rebuildArtifactExists?: (path: string) => boolean;
+  /**
+   * Delivers a rebuilt successor's startup context from the seat's persisted startup context, as a fresh
+   * launch does. Optional: absent → a rebuild primes its successor from the durable chain alone, and the
+   * result says the startup context was skipped.
+   */
+  startupOrchestrator?: StartupOrchestrator;
 }
 
 export class SeatHandoverService {
@@ -223,6 +263,8 @@ export class SeatHandoverService {
   private activityOracle: SeatHandoverServiceDeps["activityOracle"] | null;
   private rebuildPrimingResolver: SeatHandoverServiceDeps["rebuildPrimingResolver"] | null;
   private rebuildArtifactExists: (path: string) => boolean;
+  private startupOrchestrator: StartupOrchestrator | null;
+  private runtimeAdapters: Record<string, RuntimeAdapter>;
   /** Injectable sleep (tests): also carries the shared paste-then-submit settle in deliverRestorePacket. */
   private sleep: (ms: number) => Promise<void>;
   private appliedLaunchObservations: AppliedLaunchObservationStore;
@@ -246,6 +288,8 @@ export class SeatHandoverService {
     this.authoredRecapResolver = deps.authoredRecapResolver ?? null;
     this.rebuildPrimingResolver = deps.rebuildPrimingResolver ?? null;
     this.rebuildArtifactExists = deps.rebuildArtifactExists ?? existsSync;
+    this.startupOrchestrator = deps.startupOrchestrator ?? null;
+    this.runtimeAdapters = deps.runtimeAdapters ?? {};
     this.sleep = deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
     this.appliedLaunchObservations = new AppliedLaunchObservationStore(deps.db);
     this.now = deps.now ?? (() => new Date());
@@ -456,6 +500,14 @@ export class SeatHandoverService {
       guidance: "No successor was created. Inspect the seat permission selection before a separately authorized retry." }; }
     const effectivePosture = permissionOverride.launchPosture ?? successorPosture;
     const effectivePermissionMode = permissionOverride.permissionMode ?? (effectivePosture === "auto" && node.runtime === "claude-code" ? "auto" : undefined);
+    // Rebuild: the successor is a fresh conversation, so it starts from the seat's configured startup
+    // context as a fresh launch does. The startup files are written now, before the successor starts and
+    // reads them; its identity and role prompt follow once it is committed (completeRebuildStartup).
+    const rebuildStartup = parsed.source.mode === "rebuild"
+      ? await this.prepareRebuildStartup(statusResult.status.rig_id, node, latestSession.session_name,
+        { launchPosture: effectivePosture, ...(effectivePermissionMode ? { permissionMode: effectivePermissionMode } : {}) })
+      : null;
+    if (rebuildStartup && !rebuildStartup.ok) return rebuildStartup.refusal;
     // The successor must carry its own generation from its first byte. This reservation writes no
     // ledger row; commit consumes it, while every failed pre-commit branch remains unregistered.
     const occupantGeneration = this.sessionRegistry.reserveOccupantGeneration();
@@ -534,6 +586,7 @@ export class SeatHandoverService {
     // OPR.0.5.5.5 — per-source execution outcome, recorded on the result so the
     // operator sees exactly what carried context (fork origin / primed set).
     let sourceOutcome: SeatHandoverMutationResult["sourceOutcome"];
+    let rebuildPriming: RebuildPriming | null = null;
     // A fork's own id is never its parent's (the fork source) or the retiring occupant's; either answer
     // from the launch-time capture is treated as not captured.
     const launchedId = launch.resumeToken?.trim() || null;
@@ -577,31 +630,29 @@ export class SeatHandoverService {
         emptyChainReason = "artifacts" in chain ? "the durable chain resolved to zero artifacts" : chain.emptyReason;
       }
       sourceOutcome = { mode: "rebuild", primedArtifacts, gaps, ...(emptyChainReason ? { emptyChainReason } : {}) };
-      const delivered = await this.deliverRebuildPrimingPacket(launch.tmuxSession, {
-        seatRef: input.seatRef,
-        reason,
-        departingSession: latestSession.session_name,
-        primedArtifacts,
-        gaps,
-        emptyChainReason,
-      });
-      if (!delivered.ok) {
-        // Same partial-state contract as the fresh packet: unwind the candidate,
-        // binding unchanged, seat re-wakeable — never a false complete.
-        await this.successorLauncher.cleanup(launch.tmuxSession, launch.discoveredId);
-        return {
-          ok: false,
-          code: "context_delivery_failed",
-          message: `Handover failed at step "deliver-rebuild-priming": ${delivered.message}`,
-          guidance: "The successor candidate was unwound and the seat's binding is unchanged; the seat is re-wakeable from its provider session file. Retry after tmux delivery is healthy.",
-        };
+      rebuildPriming = { seatRef: input.seatRef, reason, departingSession: latestSession.session_name, primedArtifacts, gaps, emptyChainReason };
+      // With a startup context to replay, the priming follows that context after commit. Without one,
+      // the priming is all the successor gets, and it is delivered before commit.
+      if (!rebuildStartup || "skipped" in rebuildStartup) {
+        const delivered = await this.deliverRebuildPrimingPacket(launch.tmuxSession, rebuildPriming);
+        if (!delivered.ok) {
+          // Same partial-state contract as the fresh packet: unwind the candidate,
+          // binding unchanged, seat re-wakeable — never a false complete.
+          await this.successorLauncher.cleanup(launch.tmuxSession, launch.discoveredId);
+          return {
+            ok: false,
+            code: "context_delivery_failed",
+            message: `Handover failed at step "deliver-rebuild-priming": ${delivered.message}`,
+            guidance: "The successor candidate was unwound and the seat's binding is unchanged; the seat is re-wakeable from its provider session file. Retry after tmux delivery is healthy.",
+          };
+        }
+        contextDelivered = true;
       }
-      contextDelivered = true;
     }
 
     // 4. Verify continuity + rebind via the EXISTING discovered->commit path.
     //    On any failure, unwind the created successor (no binding to unwind).
-    return this.finalizeWithDiscovered({
+    const finalized = await this.finalizeWithDiscovered({
       seatRef: input.seatRef,
       status: statusResult.status,
       node,
@@ -618,6 +669,141 @@ export class SeatHandoverService {
       appliedLaunch: launch.appliedLaunch ?? null,
       sourceOutcome,
       cleanup: () => this.successorLauncher.cleanup(launch.tmuxSession, launch.discoveredId),
+    });
+    // Only a committed rebuild has startup context left to report or deliver (a rebuild always has both
+    // rebuildStartup and rebuildPriming by now).
+    if (!("result" in finalized) || !rebuildStartup || !rebuildPriming) return finalized;
+    if ("skipped" in rebuildStartup) {
+      return { ok: true, result: { ...finalized.result, startup: { status: "skipped", detail: rebuildStartup.skipped } } };
+    }
+    return this.completeRebuildStartup(finalized.result, node, launch.launchBinding, rebuildStartup.replay, rebuildPriming);
+  }
+
+  /**
+   * Rebuild, before the successor starts: read the seat's persisted startup context and write its startup
+   * files (guidance merged into the managed block, skills installed), so the successor reads them as it
+   * starts. A seat with no persisted context (OpenRig never started it) is rebuilt from its priming alone,
+   * as before. A context that can't be replayed refuses the handover before any successor is created or
+   * the seat's session and binding change, as a fresh launch refuses it; a file that fails part-way may
+   * leave the files written before it rewritten.
+   */
+  private async prepareRebuildStartup(
+    rigId: string,
+    node: NodeRow,
+    departingSession: string,
+    launchSettings: Pick<NodeBinding, "launchPosture" | "permissionMode">,
+  ): Promise<RebuildStartupPreparation> {
+    const orchestrator = this.startupOrchestrator;
+    const adapter = node.runtime ? this.runtimeAdapters[node.runtime] : undefined;
+    if (!orchestrator || !adapter) {
+      return { ok: true, skipped: "no startup orchestrator or runtime adapter is wired on this daemon" };
+    }
+    const read = readPersistedStartupContext(this.db, node.id, node.cwd ?? ".");
+    if (!read.ok && read.code === "startup_context_missing") {
+      return { ok: true, skipped: `${read.message}; the successor was primed from the durable chain alone` };
+    }
+    const refuse = (message: string): RebuildStartupPreparation => ({ ok: false, refusal: {
+      ok: false,
+      code: "startup_context_failed",
+      message,
+      guidance: "No successor was created and the seat's session and binding are unchanged, though startup files written before a failing one may have been rewritten. Fix the seat's startup context or the files named above, then retry.",
+    } });
+    if (!read.ok) return refuse(read.message);
+    if (read.context.runtime !== node.runtime) {
+      return refuse(`Persisted startup context runtime '${read.context.runtime}' does not match the seat's runtime '${node.runtime}'.`);
+    }
+    const written = await orchestrator.deliverPreLaunchFiles({
+      rigId,
+      adapter,
+      plan: read.context.plan,
+      resolvedStartupFiles: read.context.resolvedStartupFiles,
+      // The successor takes over the departing session's name, so this binding names it as the
+      // successor's own will. Nothing here is typed into that (still live) pane: send_text files are
+      // left for the startNode that follows commit.
+      binding: {
+        id: "", nodeId: node.id, attachmentType: "tmux", tmuxSession: departingSession, tmuxWindow: null, tmuxPane: null,
+        cmuxWorkspace: null, cmuxSurface: null, updatedAt: "", cwd: node.cwd ?? ".", ...launchSettings,
+      },
+    });
+    if (!written.ok) return refuse(`The seat's startup files could not be written: ${written.errors.join("; ")}`);
+    return { ok: true, replay: { orchestrator, adapter, context: read.context, warnings: written.warnings } };
+  }
+
+  /**
+   * Rebuild, after commit: the live successor gets the seat's startup context as a fresh launch delivers it
+   * (identity and role prompt, post-launch files, startup actions), then the priming packet. Startup runs
+   * through StartupOrchestrator on the committed session with the binding the successor was launched and
+   * ready-checked with, so the seat records its own startup status and events.
+   *
+   * The handover is already committed, so every outcome here, a throw included, is reported on the
+   * committed result, never as a failed handover. When the startup did not finish, or left its prompt
+   * waiting in the composer, nothing more is typed into the pane and the result says the priming was not
+   * sent. An `attention_required` startup (a native gate) is finished with `rig seat continue`; a `failed`
+   * one records nothing to continue from, so the seat needs a fresh launch.
+   */
+  private async completeRebuildStartup(
+    committed: SeatHandoverMutationResult,
+    node: NodeRow,
+    launchBinding: NodeBinding,
+    replay: RebuildStartup,
+    priming: RebuildPriming,
+  ): Promise<SeatHandoverResult> {
+    const unfinished = "the successor's startup did not finish, so nothing more was typed into its pane";
+    const reportOnCommitted = (
+      startup: NonNullable<SeatHandoverMutationResult["startup"]>,
+      warnings: string[],
+      changes: Partial<SeatHandoverMutationResult>,
+    ): SeatHandoverResult => {
+      // Both passes write the same startup files, so each can return the same warning.
+      const distinct = [...new Set(warnings)];
+      return { ok: true, result: { ...committed, ...changes, startup: { ...startup, ...(distinct.length ? { warnings: distinct } : {}) } } };
+    };
+    let started: StartupResult;
+    try {
+      started = await replay.orchestrator.startNode({
+        rigId: committed.seat.rigId,
+        nodeId: node.id,
+        sessionId: committed.newSessionId,
+        binding: { ...launchBinding, cwd: node.cwd ?? "." },
+        adapter: replay.adapter,
+        plan: replay.context.plan,
+        resolvedStartupFiles: replay.context.resolvedStartupFiles,
+        startupActions: replay.context.startupActions,
+        isRestore: false,
+        sessionName: committed.currentOccupant,
+        skipHarnessLaunch: true,
+        continueFreshStartup: true,
+        includeDurableObligations: true,
+        allowFreshFallback: false,
+      });
+    } catch (error) {
+      // startNode records its own outcome unless it throws, which would leave the seat's startup pending.
+      this.sessionRegistry.updateStartupStatus(committed.newSessionId, "failed");
+      return reportOnCommitted({ status: "failed", detail: `Startup error: ${(error as Error).message}` }, replay.warnings,
+        { currentStatus: { ...committed.currentStatus, startupStatus: "failed" }, primingNotDelivered: unfinished });
+    }
+    const warnings = [...replay.warnings, ...(started.warnings ?? [])];
+    const currentStatus = { ...committed.currentStatus, startupStatus: started.startupStatus };
+    if (!started.ok) {
+      return reportOnCommitted({ status: started.startupStatus, detail: started.errors.join("; ") }, warnings,
+        { currentStatus, primingNotDelivered: unfinished });
+    }
+    if (started.submission?.status === "staged") {
+      // A paste now would be submitted together with the startup prompt still waiting for Enter.
+      return reportOnCommitted({ status: "ready", ...(started.submission.warning ? { detail: started.submission.warning } : {}) }, warnings,
+        { currentStatus, primingNotDelivered: "the successor's startup prompt is still waiting in its composer, so the priming was not typed after it" });
+    }
+    let primed: { ok: true } | { ok: false; message: string };
+    try {
+      primed = await this.deliverRebuildPrimingPacket(committed.currentOccupant, priming);
+    } catch (error) {
+      primed = { ok: false, message: (error as Error).message };
+    }
+    return reportOnCommitted({ status: "ready" }, warnings, {
+      currentStatus,
+      // For a rebuild, the context delivered after commit is the priming packet.
+      sideEffects: { ...committed.sideEffects, startupContextDelivered: primed.ok },
+      ...(primed.ok ? {} : { primingNotDelivered: primed.message }),
     });
   }
 
@@ -837,14 +1023,7 @@ export class SeatHandoverService {
    *  gap and an empty chain out loud — never a silent partial priming. */
   private async deliverRebuildPrimingPacket(
     successorSession: string,
-    info: {
-      seatRef: string;
-      reason: string;
-      departingSession: string;
-      primedArtifacts: Array<{ address: string; label: string }>;
-      gaps: string[];
-      emptyChainReason?: string;
-    },
+    info: RebuildPriming,
   ): Promise<{ ok: true } | { ok: false; message: string }> {
     const lines = [
       `# Seat rebuild handover — ${info.seatRef}`,
@@ -931,7 +1110,7 @@ export class SeatHandoverService {
 
   private lookupLatestSession(nodeId: string): SessionRow | null {
     return this.db.prepare(
-      "SELECT id, session_name, status FROM sessions WHERE node_id = ? ORDER BY id DESC LIMIT 1"
+      "SELECT id, session_name, status, origin FROM sessions WHERE node_id = ? ORDER BY id DESC LIMIT 1"
     ).get(nodeId) as SessionRow | undefined ?? null;
   }
 
@@ -973,19 +1152,25 @@ export class SeatHandoverService {
         tmuxWindow: input.discovered.tmuxWindow,
         tmuxPane: input.discovered.tmuxPane,
       });
-      // (e/Class-B): capture the RETIRING occupant's generation BEFORE registerClaimedSession mints the
+      // (e/Class-B): capture the RETIRING occupant's generation BEFORE registerHandoverSuccessor mints the
       // successor's tenure below — after that mint the node's "current" generation IS the successor's
       // (the name is reused), so this is the only point the retiree's generation is resolvable.
       const retiringGeneration =
         this.sessionRegistry.currentOccupantGenerationForSession(input.latestSession.session_name) ?? undefined;
+      // A composer-launched successor (fresh/fork/rebuild) takes over its predecessor's pane, so the
+      // tmux session keeps its owner: a seat OpenRig launched stays OpenRig-managed, and an adopted seat
+      // stays adopted. A discovered successor is a session the operator prepared, so it is adopted.
+      const successorOrigin = input.reportedSource.mode !== "discovered" && input.latestSession.origin !== "claimed"
+        ? "launched"
+        : "claimed";
       // atom-B: a seat handover mints a HANDOVER-kind occupant generation (not the default 'adopt').
-      const newSession = this.sessionRegistry.registerClaimedSession(
+      const newSession = this.sessionRegistry.registerHandoverSuccessor(
         input.node.id,
         input.discovered.tmuxSession,
-        "handover",
+        successorOrigin,
         input.occupantGeneration,
       );
-      // W3: registerClaimedSession mints the successor generation. Only now may
+      // W3: registerHandoverSuccessor mints the successor generation. Only now may
       // the exact adapter-returned launch effect be attached to that tenure.
       // The store is best-effort, so observation persistence can never make an
       // otherwise successful handover fail.

@@ -170,6 +170,8 @@ seatRoutes.post("/handover/:seatRef", async (c) => {
       topologyRoot: String(new SettingsStore().resolveOne("topology.root").value),
       openrigHome: OPENRIG_HOME,
     }),
+    // A rebuilt successor gets the seat's startup context (identity, role, guidance) as a fresh launch does.
+    startupOrchestrator: (c.get("startupOrchestrator" as never) as import("../domain/startup-orchestrator.js").StartupOrchestrator | undefined) ?? undefined,
     // OPR.0.4.6.PI1 FR-6 — the Pi adapter in the runtime-adapter map exposes
     // the pi-runner sidecar reader; reuse it structurally (no new context var).
     piRunnerStateStore: (() => {
@@ -225,7 +227,8 @@ seatRoutes.post("/handover/:seatRef", async (c) => {
     result.code === "successor_tmux_absent" ||
     result.code === "successor_already_managed" ||
     result.code === "successor_is_current" ||
-    result.code === "runtime_mismatch") {
+    result.code === "runtime_mismatch" ||
+    result.code === "startup_context_failed") {
     return c.json(result, 409);
   }
   if (result.code === "seat_ref_required") {

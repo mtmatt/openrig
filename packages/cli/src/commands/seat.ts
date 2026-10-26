@@ -131,6 +131,10 @@ interface SeatHandoverMutationResult {
   sourceOutcome?:
     | { mode: "fork"; forkedFrom: string; forkId?: "captured" | "pending"; limit?: string }
     | { mode: "rebuild"; primedArtifacts: Array<{ address: string; label: string }>; gaps: string[]; emptyChainReason?: string };
+  /** Rebuild: the seat's startup context, delivered as a fresh launch delivers it (wire mirror of the daemon shape). */
+  startup?: { status: "ready" | "attention_required" | "failed" | "skipped"; detail?: string; warnings?: string[] };
+  /** Rebuild: why the priming packet was not sent after commit. */
+  primingNotDelivered?: string;
   sideEffects: {
     departingSessionKilled: false;
     startupContextDelivered: boolean;
@@ -235,7 +239,8 @@ function printHumanHandoverResult(result: SeatHandoverMutationResult): void {
   } else if (result.sourceOutcome?.mode === "rebuild") {
     const outcome = result.sourceOutcome;
     if (outcome.primedArtifacts.length > 0) {
-      console.log(`Rebuild primed from ${outcome.primedArtifacts.length} durable artifact${outcome.primedArtifacts.length === 1 ? "" : "s"}:`);
+      const count = `${outcome.primedArtifacts.length} durable artifact${outcome.primedArtifacts.length === 1 ? "" : "s"}`;
+      console.log(result.primingNotDelivered ? `Rebuild priming set, ${count}, NOT delivered (see below):` : `Rebuild primed from ${count}:`);
       for (const artifact of outcome.primedArtifacts) console.log(`  - ${artifact.address} — ${artifact.label}`);
     }
     for (const gap of outcome.gaps) console.log(`  ! declared but missing on disk: ${gap}`);
@@ -243,6 +248,7 @@ function printHumanHandoverResult(result: SeatHandoverMutationResult): void {
       console.log(`Rebuild chain was EMPTY: ${outcome.emptyChainReason}`);
     }
   }
+  if (result.startup) printRebuildStartup(result.startup);
   if (result.sideEffects.startupContextDelivered) {
     if (result.source.mode === "rebuild") {
       console.log("The rebuild priming packet was delivered to the successor.");
@@ -252,6 +258,9 @@ function printHumanHandoverResult(result: SeatHandoverMutationResult): void {
       console.log("The captured startup context (restore packet) was delivered to the successor.");
     }
     console.log("No conversation continuity, provenance markdown, or session stop was performed.");
+  } else if (result.primingNotDelivered) {
+    console.log(`The rebuild priming packet was NOT delivered: ${result.primingNotDelivered}.`);
+    console.log(rebuildPrimingNextStep(result));
   } else if (result.source.mode === "fork") {
     console.log("No packet delivery: fork context rides the native conversation itself.");
   } else {
@@ -259,6 +268,42 @@ function printHumanHandoverResult(result: SeatHandoverMutationResult): void {
     // separate context delivery is performed.
     console.log("No conversation continuity, startup context delivery, provenance markdown, or session stop was performed.");
   }
+}
+
+/** A rebuild's startup context: delivered as a fresh launch delivers it, stopped short, or skipped. */
+function printRebuildStartup(startup: NonNullable<SeatHandoverMutationResult["startup"]>): void {
+  if (startup.status === "ready") {
+    console.log("The seat's startup context (identity, role, guidance) was delivered to the successor as a fresh launch delivers it.");
+  } else if (startup.status === "skipped") {
+    console.log(`No startup context was delivered: ${startup.detail ?? "skipped"}.`);
+  } else {
+    console.log(`Startup context delivery stopped (${startup.status}): ${startup.detail ?? "no detail"}`);
+  }
+  for (const warning of startup.warnings ?? []) console.log(`  ! ${warning}`);
+}
+
+/** What the operator does when a committed rebuild's priming packet was not sent: finish or redo the
+ *  startup as its status allows, then hand the seat its priming set. */
+function rebuildPrimingNextStep(result: SeatHandoverMutationResult): string {
+  const outcome = result.sourceOutcome?.mode === "rebuild" ? result.sourceOutcome : null;
+  const prime = outcome && outcome.primedArtifacts.length > 0
+    ? "point the seat at the priming set listed above"
+    : "tell the seat it was rebuilt (its durable chain was empty)";
+  switch (result.startup?.status) {
+    case "attention_required":
+      return `Next: resolve the prompt in its pane, finish the startup with \`rig seat continue ${result.seat.ref}\`, then ${prime}.`;
+    case "failed":
+      return `Next: this startup can't be continued; relaunch with \`rig seat launch ${result.seat.ref} --fresh --stop --reason <text>\`, then ${prime}.`;
+    default:
+      return `Next: once the successor has taken its startup prompt, ${prime}.`;
+  }
+}
+
+/** A committed handover that still needs the operator: its startup stopped short or its priming wasn't sent. */
+function handoverNeedsAttention(data: unknown): boolean {
+  const result = data as Partial<SeatHandoverMutationResult> | null;
+  return result?.dryRun === false
+    && (result.startup?.status === "attention_required" || result.startup?.status === "failed" || result.primingNotDelivered !== undefined);
 }
 
 function printHumanSwitchClient(r: SeatSwitchClientResponse): void {
@@ -1073,6 +1118,7 @@ export async function runSeatHandover(seat: string, opts: HandoverActionOpts, de
   if (opts.json) {
     console.log(JSON.stringify(res.data, null, 2));
     if (res.status >= 400) process.exitCode = res.status >= 500 ? 2 : 1;
+    else if (handoverNeedsAttention(res.data)) process.exitCode = 1;
     return;
   }
 
@@ -1087,6 +1133,7 @@ export async function runSeatHandover(seat: string, opts: HandoverActionOpts, de
     printHumanHandoverPlan(data);
   } else {
     printHumanHandoverResult(data);
+    if (handoverNeedsAttention(data)) process.exitCode = 1;
   }
 }
 
