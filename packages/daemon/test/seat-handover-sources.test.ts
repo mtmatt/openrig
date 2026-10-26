@@ -119,10 +119,12 @@ describe("SeatHandoverService source execution (OPR.0.5.5.5)", () => {
     });
   }
 
-  function seedSeat(opts?: { resumeToken?: string | null }) {
+  function seedSeat(opts?: { resumeToken?: string | null; adopted?: boolean }) {
     const rig = rigRepo.createRig("seat-rig");
     const node = rigRepo.addNode(rig.id, "dev.impl", { runtime: "codex", cwd: "/project" });
-    const session = sessionRegistry.registerSession(node.id, "dev-impl@seat-rig");
+    const session = opts?.adopted
+      ? sessionRegistry.registerClaimedSession(node.id, "dev-impl@seat-rig")
+      : sessionRegistry.registerSession(node.id, "dev-impl@seat-rig");
     sessionRegistry.updateStatus(session.id, "running");
     sessionRegistry.updateStartupStatus(session.id, "ready", "2026-04-20T12:00:00Z");
     sessionRegistry.updateBinding(node.id, { tmuxSession: "dev-impl@seat-rig", tmuxPane: "%0" });
@@ -460,6 +462,73 @@ describe("SeatHandoverService source execution (OPR.0.5.5.5)", () => {
     expect(result).toMatchObject({ ok: false, code: "discovered_not_active" });
     expect(liveSessionId(node.id)).toBe(sessionId);
     expect(discoveryRepo.getDiscoveredSession(row.id)).toMatchObject({ status: "claimed", claimedNodeId: other.id });
+  });
+
+  // A composer-launched successor respawns into the seat's own pane, so the seat keeps its owner; a discovered
+  // successor, or one that replaced no live occupant, is adopted.
+  function liveSessionOrigin(nodeId: string) {
+    const row = db.prepare("SELECT origin FROM sessions WHERE node_id = ? AND status NOT IN ('superseded', 'detached', 'exited') ORDER BY id DESC").get(nodeId) as { origin: string } | undefined;
+    return row?.origin;
+  }
+  function newLifecycleService(): SeatLifecycleService {
+    const probeSession = vi.fn(async () => ({ state: "present" as const }));
+    return new SeatLifecycleService({ db, rigRepo, sessionRegistry, eventBus,
+      tmuxAdapter: { ...tmux(), probeSession } as unknown as TmuxAdapter,
+      nodeLauncher: {} as never, startupOrchestrator: {} as never, runtimeAdapters: { codex: codexAdapter() } });
+  }
+  function preparedSuccessor() {
+    return `discovered:${discoveryRepo.upsertDiscoveredSession({ tmuxSession: "prepared-successor", tmuxPane: "%5", runtimeHint: "codex", confidence: "high" }).id}`;
+  }
+
+  it.each(["fresh", "fork:dev-impl@seat-rig", "rebuild"] as const)("%s: an OpenRig-launched seat stays launched, so seat stop still kills the successor", async (source) => {
+    const { node } = seedSeat({ resumeToken: "native-abc" });
+
+    const result = await service.handover({ seatRef: "dev-impl@seat-rig", reason: "context-wall", source });
+
+    expect(result).toMatchObject({ ok: true });
+    expect(liveSessionOrigin(node.id)).toBe("launched");
+    expect(await newLifecycleService().stopSeat({ seatRef: "dev-impl@seat-rig", reason: "relaunch" })).toMatchObject({ ok: true });
+    expect(killSession).toHaveBeenCalledWith("dev-impl@seat-rig");
+  });
+
+  it("rebuild: a fresh launch with --stop afterwards plans to stop the successor instead of refusing it as adopted", async () => {
+    const { node } = seedSeat();
+    db.prepare(`INSERT INTO node_startup_context
+      (node_id, projection_entries_json, resolved_files_json, startup_actions_json, runtime)
+      VALUES (?, '[]', '[]', '[]', 'codex')`).run(node.id);
+    expect(await service.handover({ seatRef: "dev-impl@seat-rig", reason: "context-wall", source: "rebuild" })).toMatchObject({ ok: true });
+
+    const plan = await newLifecycleService().planFresh({ seatRef: "dev-impl@seat-rig", fresh: true, stop: true });
+
+    expect(plan).toMatchObject({ ok: true, launchable: true, wouldStop: true, blockers: [] });
+  });
+
+  it.each(["rebuild", "discovered"] as const)("%s: an adopted seat stays adopted", async (mode) => {
+    const { node } = seedSeat({ adopted: true });
+
+    const result = await service.handover({ seatRef: "dev-impl@seat-rig", reason: "context-wall", source: mode === "discovered" ? preparedSuccessor() : mode });
+
+    expect(result).toMatchObject({ ok: true });
+    expect(liveSessionOrigin(node.id)).toBe("claimed");
+  });
+
+  it("discovered: the operator's prepared successor is adopted, even on a seat OpenRig launched", async () => {
+    const { node } = seedSeat();
+
+    const result = await service.handover({ seatRef: "dev-impl@seat-rig", reason: "context-wall", source: preparedSuccessor() });
+
+    expect(result).toMatchObject({ ok: true });
+    expect(liveSessionOrigin(node.id)).toBe("claimed");
+  });
+
+  it("fresh: a successor that replaced no live occupant is adopted, since OpenRig can't say whose session it took over", async () => {
+    const { node, sessionId } = seedSeat();
+    sessionRegistry.updateStatus(sessionId, "detached");
+
+    const result = await service.handover({ seatRef: "dev-impl@seat-rig", reason: "context-wall", source: "fresh" });
+
+    expect(result).toMatchObject({ ok: true });
+    expect(liveSessionOrigin(node.id)).toBe("claimed");
   });
 });
 

@@ -22,8 +22,8 @@ import { terminatePaneInPlace, type PaneTerminationResult } from "./pane-cutover
  * a LIVE, READY agent (not a bare shell), records it as an ACTIVE discovery
  * candidate, and returns that candidate + the captured launch resume token so
  * the composer can route it through the EXISTING discovered->commit rebind path.
- * It deliberately does NOT `registerClaimedSession`/`upsertBinding` — the
- * session stays unmanaged until the handover `commit` claims it, so the
+ * It deliberately does NOT register a session or `upsertBinding` — the
+ * session stays unmanaged until the handover `commit` registers it, so the
  * departing seat's binding is never touched before successor readiness.
  *
  * B1 (rev1-dual fix): the successor is launched through the runtime adapter's

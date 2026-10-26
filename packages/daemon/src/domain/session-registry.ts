@@ -290,13 +290,36 @@ export class SessionRegistry {
     kind: OccupantKind = "adopt",
     reservedGeneration?: string | null,
   ): Session {
+    return this.registerRunningSession(nodeId, sessionName, "claimed", kind, reservedGeneration);
+  }
+
+  /** Register the live successor a seat handover commits, as a handover generation. Like a claimed
+   *  session it skips naming validation and starts running and ready. `origin` records who owns its tmux
+   *  session: 'launched' keeps the seat OpenRig-managed, so stop, clean, restart and fresh launch still act
+   *  on it; 'claimed' leaves it adopted. */
+  registerHandoverSuccessor(
+    nodeId: string,
+    sessionName: string,
+    origin: Session["origin"],
+    reservedGeneration?: string | null,
+  ): Session {
+    return this.registerRunningSession(nodeId, sessionName, origin, "handover", reservedGeneration);
+  }
+
+  private registerRunningSession(
+    nodeId: string,
+    sessionName: string,
+    origin: Session["origin"],
+    kind: OccupantKind,
+    reservedGeneration?: string | null,
+  ): Session {
     this.assertAddressAvailable(nodeId, sessionName, this.getBindingForNode(nodeId)?.attachmentType !== "external_cli");
     const id = ulid();
     this.db
       .prepare(
-        "INSERT INTO sessions (id, node_id, session_name, status, origin, startup_status) VALUES (?, ?, ?, 'running', 'claimed', 'ready')"
+        "INSERT INTO sessions (id, node_id, session_name, status, origin, startup_status) VALUES (?, ?, ?, 'running', ?, 'ready')"
       )
-      .run(id, nodeId, sessionName);
+      .run(id, nodeId, sessionName, origin);
     this.mintOccupantTenureBestEffort(nodeId, kind, reservedGeneration); // atom-B: mint this occupant generation
     this.observeWatchdogRegistration(nodeId, sessionName, kind);
 

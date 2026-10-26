@@ -1045,8 +1045,8 @@ export class SeatHandoverService {
     const handoverAt = this.now().toISOString();
     const tx = this.db.transaction(() => {
       const rows = this.db.prepare(
-        "SELECT id FROM sessions WHERE node_id = ? AND status NOT IN ('superseded', 'detached', 'exited') ORDER BY id"
-      ).all(input.node.id) as Array<{ id: string }>;
+        "SELECT id, origin FROM sessions WHERE node_id = ? AND status NOT IN ('superseded', 'detached', 'exited') ORDER BY id"
+      ).all(input.node.id) as Array<{ id: string; origin: string }>;
       const previousSessionIdsSuperseded = rows.map((row) => row.id);
 
       if (previousSessionIdsSuperseded.length > 0) {
@@ -1061,19 +1061,27 @@ export class SeatHandoverService {
         tmuxWindow: input.discovered.tmuxWindow,
         tmuxPane: input.discovered.tmuxPane,
       });
-      // (e/Class-B): capture the RETIRING occupant's generation BEFORE registerClaimedSession mints the
+      // (e/Class-B): capture the RETIRING occupant's generation BEFORE registerHandoverSuccessor mints the
       // successor's tenure below — after that mint the node's "current" generation IS the successor's
       // (the name is reused), so this is the only point the retiree's generation is resolvable.
       const retiringGeneration =
         this.sessionRegistry.currentOccupantGenerationForSession(input.latestSession.session_name) ?? undefined;
-      // atom-B: a seat handover mints a HANDOVER-kind occupant generation (not the default 'adopt').
-      const newSession = this.sessionRegistry.registerClaimedSession(
+      // A composer-launched successor (fresh/fork/rebuild) respawns into the seat's own pane and replaces its live
+      // occupant, so it keeps that occupant's owner: a seat OpenRig launched stays launched, an adopted seat stays
+      // adopted. A discovered successor is a session the operator prepared, so it is adopted, and so is one that
+      // replaced no live occupant: OpenRig can't say whose session it took over.
+      const replacedLiveOccupant = previousSessionIdsSuperseded.includes(input.latestSession.id);
+      const successorOrigin = input.reportedSource.mode === "discovered" || !replacedLiveOccupant || rows.some((row) => row.origin === "claimed")
+        ? "claimed"
+        : "launched";
+      // atom-B: a seat handover mints a HANDOVER-kind occupant generation.
+      const newSession = this.sessionRegistry.registerHandoverSuccessor(
         input.node.id,
         input.discovered.tmuxSession,
-        "handover",
+        successorOrigin,
         input.occupantGeneration,
       );
-      // W3: registerClaimedSession mints the successor generation. Only now may
+      // W3: registerHandoverSuccessor mints the successor generation. Only now may
       // the exact adapter-returned launch effect be attached to that tenure.
       // The store is best-effort, so observation persistence can never make an
       // otherwise successful handover fail.
