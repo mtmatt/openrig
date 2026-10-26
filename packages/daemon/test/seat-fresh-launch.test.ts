@@ -551,7 +551,8 @@ describe("SeatLifecycleService.launchFresh", () => {
     const notExplicit = await service.launchFresh({ seatRef: "dev.impl", fresh: false, reason: "x" });
     expect(notExplicit).toMatchObject({ ok: false, code: "fresh_required" });
     const missing = await service.launchFresh({ seatRef: "dev.impl", fresh: true, reason: "x" });
-    expect(missing).toMatchObject({ ok: false, code: "startup_context_missing" });
+    expect(missing).toMatchObject({ ok: false, code: "startup_context_missing",
+      message: `Persisted startup context is missing for node ${seat.node.id}; fresh launch refuses to invent an empty startup policy.` });
     expect(alive).not.toContain(seat.sessionName);
 
     db.prepare(

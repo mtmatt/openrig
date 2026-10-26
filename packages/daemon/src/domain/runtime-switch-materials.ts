@@ -4,7 +4,7 @@ import type Database from "better-sqlite3";
 import type { AgentSpec, Node, RigSpec, RigSpecPod, RigSpecPodMember, StartupAction } from "./types.js";
 import type { NodeBinding, ResolvedStartupFile, RuntimeAdapter } from "./runtime-adapter.js";
 import { resolveConcreteHint } from "./runtime-adapter.js";
-import type { ParsedStartupContext } from "./seat-lifecycle-service.js";
+import type { ParsedStartupContext } from "./persisted-startup-context.js";
 import { resolveAgentRef, type AgentResolverFsOps } from "./agent-resolver.js";
 import { resolveNodeConfig, selectedPluginPaths, type ResolutionContext } from "./profile-resolver.js";
 import { claudeConflictTargetPath, filterProtectedProjections, planProjection, projectionConflictWarnings, type ProjectionPlan } from "./projection-planner.js";

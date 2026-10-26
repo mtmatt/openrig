@@ -11,7 +11,7 @@ import { RigRepository } from "../src/domain/rig-repository.js";
 import { planRuntimeSwitchMaterials, type SwitchRuntime } from "../src/domain/runtime-switch-materials.js";
 import { seatSkillPaths } from "../src/domain/seat-skill-storage.js";
 import { seatSkillsPointerStartupFile } from "../src/domain/rigspec-instantiator.js";
-import type { ParsedStartupContext } from "../src/domain/seat-lifecycle-service.js";
+import type { ParsedStartupContext } from "../src/domain/persisted-startup-context.js";
 import type { Node } from "../src/domain/types.js";
 
 const AGENT_YAML = `name: impl

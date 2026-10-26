@@ -9,7 +9,7 @@ import { isClaudeResumeType } from "../adapters/claude-resume.js";
 import type { StartupAction, StartupProofSelection, StartupFailureStage } from "./types.js";
 import type {
   RuntimeAdapter, NodeBinding, ResolvedStartupFile,
-  ProjectionResult, StartupDeliveryResult, ForkSource, ReadinessResult,
+  StartupDeliveryResult, ForkSource, ReadinessResult,
 } from "./runtime-adapter.js";
 import { isAttentionRequiredReadinessCode, resolveConcreteHint } from "./runtime-adapter.js";
 import type { ProjectionPlan } from "./projection-planner.js";
@@ -28,7 +28,7 @@ import { observeClaudeResumeLaunch, type ClaudeLaunchedProcess, type NativeProce
 import { CommunityHarnessRuntimeAdapter } from "../adapters/community-harness-runtime-adapter.js";
 import { join } from "node:path";
 import { guidanceFileIsLink, readFootprintAnswer, readGuidanceFile, routerLineSkipReason, type FootprintAnswer, type RouterLineWriteResult } from "./footprint-choice.js";
-import { SEAT_SKILLS_BOOTSTRAP_BLOCK_ID, describeSkillRouterFootprint, seatSkillsLineEdited, refusedSeatSkillsRootForNode, seatCatalogKeptNote, seatRouterKeptNote, seatSkillPathsForNode, seatSkillPluginDirForNode, writeSeatSkillCatalog, writeSeatSkillRouter } from "./seat-skill-storage.js";
+import { SEAT_SKILLS_BOOTSTRAP_BLOCK_ID, describeSkillRouterFootprint, seatSkillsLineEdited, refusedSeatSkillsRootForNode, seatCatalogKeptNote, seatRouterKeptNote, seatSkillPathsForNode, seatSkillPluginDirForNode, writeSeatSkillCatalog, writeSeatSkillRouter, type SeatSkillPaths } from "./seat-skill-storage.js";
 import { recordConversationPromptForNode, recordForkConversationPromptForNode, seatLaunchAdditionsForLaunch, systemPromptPendingNoteForNode } from "./seat-launch-additions.js";
 
 // Why a startup prompt's submission could not be confirmed, as told to the operator when the
@@ -344,31 +344,14 @@ export class StartupOrchestrator {
     } catch (error) {
       return this.fail(input, "failed", [`Permission selection: ${(error as Error).message}`], undefined, false, undefined, false, "permission_selection", true);
     }
+    // OPR.0.7.0.13 (Codex C2): a Codex seat's own storage, looked up once: its skills go there, and its catalog, rebuilt
+    // there after this launch's projection, is what its per-seat startup text delivers.
+    const codexSeatSkills = input.adapter.runtime === "codex" ? seatSkillPathsForNode(this.db, input.nodeId) : undefined;
     // #25: launch, restore replay, relaunch, continue and added members deliver
     // guidance through here, so the rig's managed-block destination is bound once
     // for the adapter. Handover does not come here: the successor launches directly
     // and reads the file already written in its cwd.
-    const rigRepo = new RigRepository(this.db);
-    input = { ...input, binding: { ...input.binding, nonInterruptive: rigRepo.getRigNonInterruptive(input.rigId) } };
-    const claudeManagedBlockFile = rigRepo.getRigClaudeManagedBlockFile(input.rigId);
-    if (claudeManagedBlockFile) input = { ...input, binding: { ...input.binding, claudeManagedBlockFile } };
-    // OPR.0.7.0.13: a Claude seat whose plugin OpenRig keeps (already on its CLAUDE_CODE_PLUGIN_DIRS) gets every skill
-    // there, profile resources and startup skill files too. A seat without one keeps the project, as before, so a
-    // skill never lands where nothing points.
-    if (input.adapter.runtime === "claude-code" && !input.binding.seatSkillsRoot) {
-      const seatPlugin = seatSkillPluginDirForNode(this.db, input.nodeId);
-      if (seatPlugin) input = { ...input, binding: { ...input.binding, seatSkillsRoot: join(seatPlugin, "skills") } };
-    }
-    // OPR.0.7.0.13 (Codex C2): a Codex seat with its own storage gets its skills there, and its catalog, rebuilt after
-    // this launch's projection, is what its per-seat startup text delivers.
-    const codexSeatSkills = input.adapter.runtime === "codex" ? seatSkillPathsForNode(this.db, input.nodeId) : undefined;
-    if (codexSeatSkills && !input.binding.seatSkillsRoot) input = { ...input, binding: { ...input.binding, seatSkillsRoot: codexSeatSkills.skillsRoot } };
-    // A seat whose storage a link refused keeps its skills' target there, where each is refused and named; they never
-    // fall back into the project.
-    if (!input.binding.seatSkillsRoot && (input.adapter.runtime === "claude-code" || input.adapter.runtime === "codex")) {
-      const refused = refusedSeatSkillsRootForNode(this.db, input.nodeId);
-      if (refused) input = { ...input, binding: { ...input.binding, seatSkillsRoot: refused.skillsRoot, seatSkillsRefused: refused.reason } };
-    }
+    input = { ...input, binding: this.withDeliverySettings(input, codexSeatSkills) };
     // OPR.0.7.0.9: a Claude seat's own launch additions, the copies present in its seat storage; a missing copy is named.
     if (input.adapter.runtime === "claude-code" && !input.binding.launchAdditions) {
       const { additions, missing, refused } = seatLaunchAdditionsForLaunch(this.db, input.nodeId);
@@ -404,130 +387,14 @@ export class StartupOrchestrator {
     }
     this.eventBus.emit({ type: "node.startup_pending", rigId: input.rigId, nodeId: input.nodeId, startupProof });
 
-    // 2. Project resources. A contained Claude resume has an intentionally empty
-    // replay plan, not a newly selected profile with activity hooks removed.
-    // RestoreOrchestrator already reconciled the saved activity selection before
-    // native resume. Fresh launches still project empty plans to support removal.
-    let projectionResult: ProjectionResult;
-    if (!(input.preserveStartupContext && input.adapter.runtime === "claude-code" && input.plan.entries.length === 0)) try {
-      const skip = input.replaySkip;
-      const projectedPlan = skip && skip.entryIds.size > 0
-        ? { ...input.plan, entries: input.plan.entries.filter((e) => !(e.category === "skill" && skip.entryIds.has(e.effectiveId))) }
-        : input.plan;
-      projectionResult = await input.adapter.project(projectedPlan, input.binding);
-      warnings.push(...(projectionResult.warnings ?? []));
-      if (projectionResult.failed.length > 0) {
-        for (const f of projectionResult.failed) {
-          errors.push(`Projection failed for ${f.effectiveId}: ${f.error}`);
-        }
-        return this.fail(input, "failed", errors, undefined, false, undefined, false, "projection", true);
-      }
-    } catch (err) {
-      errors.push(`Projection error: ${(err as Error).message}`);
-      return this.fail(input, "failed", errors, undefined, false, undefined, false, "projection", true);
+    // 2-4. Project resources and deliver the pre-launch (filesystem) startup files, then the seat-skills line, router
+    // and catalog that follow them.
+    const filesystemStartup = await this.deliverFilesystemStartup(input, context, codexSeatSkills, warnings);
+    if (!filesystemStartup.ok) {
+      return this.fail(input, "failed", filesystemStartup.errors, undefined, false, undefined, false, filesystemStartup.stage, true);
     }
-
-    // 3. Partition startup files by concrete hint: pre-launch (filesystem) vs post-launch (TUI)
-    // Note: new file-building paths (NS-T05+) emit only concrete hints. The auto fallback
-    // is compatibility-only for pre-NS-T05 persisted startup contexts in node_startup_context.
-    //
-    // Rebuild-mode artifacts (when set) are merged in front of resolvedStartupFiles
-    // so the operator's trust-precedence ordering is preserved when the post-launch
-    // delivery loop walks the array. Rebuild artifacts are tagged
-    // appliesOn: ["fresh_start"] by the resolver, which matches the rebuild context.
-    const sourceFiles = input.rebuildArtifacts && input.rebuildArtifacts.length > 0
-      ? [...input.rebuildArtifacts, ...input.resolvedStartupFiles]
-      : input.resolvedStartupFiles;
-    // OPR.0.7.0.13 (router, R1.1): the one-line bootstrap is delivered on its own (below), only with a yes, and never
-    // stops the launch. Every start reads the answer, so a saved context from before the line was opt-in (or from while
-    // it was on) delivers it only while the yes stands. Nothing already written is removed.
-    const bootstrapLine = sourceFiles.filter((f) => f.appliesOn.includes(context) && !input.replaySkip?.files.has(f.absolutePath)
-      && isSeatSkillsBootstrapLine(f));
-    const applicableFiles = sourceFiles.filter((f) => f.appliesOn.includes(context) && !input.replaySkip?.files.has(f.absolutePath)
-      && !isSeatSkillsBootstrapLine(f));
-    const preLaunchFiles: ResolvedStartupFile[] = [];
-    let postLaunchFiles: ResolvedStartupFile[] = [];
-    for (const f of applicableFiles) {
-      const hint = f.deliveryHint === "auto"
-        ? resolveConcreteHint(f.path, this.safeReadFile(f.absolutePath), f.orientation)
-        : f.deliveryHint;
-      if (hint === "send_text") {
-        postLaunchFiles.push(f);
-      } else {
-        preLaunchFiles.push(f);
-      }
-    }
-
-    // 4. Deliver pre-launch files (filesystem: guidance_merge, skill_install)
-    // Always call even with empty list so adapters can provision runtime-specific config (e.g. context collectors)
-    try {
-      const deliveryResult = await input.adapter.deliverStartup(preLaunchFiles, input.binding);
-      warnings.push(...(deliveryResult.warnings ?? []));
-      if (deliveryResult.failed.length > 0) {
-        for (const f of deliveryResult.failed) {
-          errors.push(`Pre-launch file delivery failed: ${f.path}: ${f.error}`);
-        }
-        return this.fail(input, "failed", errors, undefined, false, undefined, false, "pre_launch_files", true);
-      }
-    } catch (err) {
-      errors.push(`Pre-launch delivery error: ${(err as Error).message}`);
-      return this.fail(input, "failed", errors, undefined, false, undefined, false, "pre_launch_files", true);
-    }
-
-    // OPR.0.7.0.13 (router, R1.1): the bootstrap line, on its own: with a yes it is delivered into the seat's guidance file;
-    // otherwise it is skipped with the answer's reason. A line that can't be written is this start's named result (from
-    // the delivery's own error), never a failed launch.
-    let routerLine: RouterLineWriteResult | undefined;
-    if (bootstrapLine.length > 0) {
-      let answer: FootprintAnswer | null = null;
-      try { answer = readFootprintAnswer(this.readinessSettings); } catch { /* unreadable: reported as such */ }
-      const target = describeSkillRouterFootprint([{ seat: input.sessionName ?? input.nodeId, runtime: input.adapter.runtime,
-        cwd: input.binding.cwd ?? ".", claudeManagedBlockFile: input.binding.claudeManagedBlockFile ?? null }]).files[0]?.path;
-      if (target) {
-        const skip = routerLineSkipReason(answer);
-        if (skip) routerLine = { answer, files: [{ path: target, outcome: "skipped", reason: skip }] };
-        else if (guidanceFileIsLink(target)) {
-          // A linked guidance file is someone's layout, often a file outside the project: the line isn't written through it.
-          routerLine = { answer, files: [{ path: target, outcome: "linked" }] };
-          warnings.push(`seat_skills_line_linked: ${target} is a link, so the line wasn't written through it; the seat started without it`);
-        } else if (seatSkillsLineEdited(readGuidanceFile(target))) {
-          // Someone edited the line: a start leaves their block as it is, as rig down does.
-          routerLine = { answer, files: [{ path: target, outcome: "edited" }] };
-          warnings.push(`seat_skills_line_edited: ${target} holds an edited seat-skills line, so this start left it as it is`);
-        } else {
-          try {
-            // The saved line is optional, and the adapters swallow an optional file's write error; for this one isolated
-            // call, mark it required so the adapter reports the real error, which is handled here without failing the start.
-            const delivered = await input.adapter.deliverStartup(bootstrapLine.map((f) => ({ ...f, required: true })), input.binding);
-            const failed = delivered.failed.find((f) => f.path === bootstrapLine[0]!.path) ?? delivered.failed[0];
-            routerLine = { answer, files: [failed ? { path: target, outcome: "unwritable", error: failed.error } : { path: target, outcome: "delivered" }] };
-          } catch (err) {
-            routerLine = { answer, files: [{ path: target, outcome: "unwritable", error: (err as Error).message }] };
-          }
-          const unwritable = routerLine.files.find((f) => f.outcome === "unwritable");
-          if (unwritable && unwritable.outcome === "unwritable") warnings.push(`seat_skills_line_unwritable: ${unwritable.path}: ${unwritable.error}; the seat started without it`);
-        }
-      }
-    }
-
-    // OPR.0.7.0.13 (router): the seat's one generated router skill, after every pre-launch skill writer, so it lists
-    // every skill the seat starts with. A router that can't be written is this seat's named result; the launch goes on.
-    const routerSeatSkills = input.adapter.runtime === "claude-code" ? seatSkillPathsForNode(this.db, input.nodeId) : codexSeatSkills;
-    if (routerSeatSkills) {
-      try {
-        const router = writeSeatSkillRouter(routerSeatSkills);
-        if (router.kept) warnings.push(seatRouterKeptNote(router));
-      } catch (err) { warnings.push(`seat_router_not_written: ${(err as Error).message}`); }
-    }
-
-    // OPR.0.7.0.13 (Codex C2): the seat's catalog, built after every pre-launch skill writer (projection and startup
-    // skill files) and before the post-launch text that sends it, so it lists every skill the seat starts with.
-    if (codexSeatSkills) {
-      try {
-        const catalog = writeSeatSkillCatalog(codexSeatSkills);
-        if (catalog.kept) warnings.push(`${seatCatalogKeptNote(catalog)}${catalog.reason === "edited" ? ", and that file is what the seat's startup text sends" : ""}`);
-      } catch (err) { warnings.push(`seat skill catalog not written: ${(err as Error).message}`); }
-    }
+    let postLaunchFiles = filesystemStartup.postLaunchFiles;
+    const routerLine = filesystemStartup.routerLine;
 
     // 7. Persist startup context for restore replay
     if (!input.preserveStartupContext) try {
@@ -950,6 +817,166 @@ export class StartupOrchestrator {
     this.eventBus.emit({ type: "node.startup_ready", rigId: input.rigId, nodeId: input.nodeId, ...(submission ? { submission } : {}) });
 
     return { ok: true, startupStatus: "ready", continuityOutcome, ...(submission ? { submission } : {}), ...(routerLine ? { routerLine } : {}), ...(resumedProcess ? { resumedProcess } : {}) };
+  }
+
+  /**
+   * The binding fields a start's adapter reads from its rig and seat: the rig's non-interruptive opt-in and managed-block
+   * destination, and where the seat's skills go (its own storage, or the storage a link refused). Launch additions, which
+   * only a launch reads, stay in startNode. A Codex seat's storage comes from the caller, which hands the same lookup to
+   * deliverFilesystemStartup for its catalog.
+   */
+  private withDeliverySettings(input: Pick<StartupInput, "rigId" | "nodeId" | "adapter" | "binding">, codexSeatSkills: SeatSkillPaths | undefined): NodeBinding {
+    const rigRepo = new RigRepository(this.db);
+    let binding: NodeBinding = { ...input.binding, nonInterruptive: rigRepo.getRigNonInterruptive(input.rigId) };
+    const claudeManagedBlockFile = rigRepo.getRigClaudeManagedBlockFile(input.rigId);
+    if (claudeManagedBlockFile) binding = { ...binding, claudeManagedBlockFile };
+    // OPR.0.7.0.13: a Claude seat whose plugin OpenRig keeps (already on its CLAUDE_CODE_PLUGIN_DIRS) gets every skill
+    // there, profile resources and startup skill files too. A seat without one keeps the project, as before, so a
+    // skill never lands where nothing points.
+    if (input.adapter.runtime === "claude-code" && !binding.seatSkillsRoot) {
+      const seatPlugin = seatSkillPluginDirForNode(this.db, input.nodeId);
+      if (seatPlugin) binding = { ...binding, seatSkillsRoot: join(seatPlugin, "skills") };
+    }
+    // OPR.0.7.0.13 (Codex C2): a Codex seat with its own storage gets its skills there.
+    if (codexSeatSkills && !binding.seatSkillsRoot) binding = { ...binding, seatSkillsRoot: codexSeatSkills.skillsRoot };
+    // A seat whose storage a link refused keeps its skills' target there, where each is refused and named; they never
+    // fall back into the project.
+    if (!binding.seatSkillsRoot && (input.adapter.runtime === "claude-code" || input.adapter.runtime === "codex")) {
+      const refused = refusedSeatSkillsRootForNode(this.db, input.nodeId);
+      if (refused) binding = { ...binding, seatSkillsRoot: refused.skillsRoot, seatSkillsRefused: refused.reason };
+    }
+    return binding;
+  }
+
+  /**
+   * The filesystem part of a start, before its harness launches: project the plan's resources, partition the startup
+   * files that apply in `context`, deliver the pre-launch (filesystem) ones, then write the seat-skills line, router and
+   * catalog that follow them. Returns the post-launch files to send once the harness is ready, with the seat-skills
+   * line's outcome, or the stage that failed with its errors.
+   */
+  private async deliverFilesystemStartup(
+    input: Pick<StartupInput, "nodeId" | "sessionName" | "adapter" | "binding" | "plan" | "resolvedStartupFiles" | "rebuildArtifacts" | "replaySkip" | "preserveStartupContext">,
+    context: "fresh_start" | "restore",
+    codexSeatSkills: SeatSkillPaths | undefined,
+    warnings: string[],
+  ): Promise<{ ok: true; postLaunchFiles: ResolvedStartupFile[]; routerLine?: RouterLineWriteResult }
+    | { ok: false; stage: "projection" | "pre_launch_files"; errors: string[] }> {
+    // 2. Project resources. A contained Claude resume has an intentionally empty
+    // replay plan, not a newly selected profile with activity hooks removed.
+    // RestoreOrchestrator already reconciled the saved activity selection before
+    // native resume. Fresh launches still project empty plans to support removal.
+    if (!(input.preserveStartupContext && input.adapter.runtime === "claude-code" && input.plan.entries.length === 0)) try {
+      const skip = input.replaySkip;
+      const projectedPlan = skip && skip.entryIds.size > 0
+        ? { ...input.plan, entries: input.plan.entries.filter((e) => !(e.category === "skill" && skip.entryIds.has(e.effectiveId))) }
+        : input.plan;
+      const projectionResult = await input.adapter.project(projectedPlan, input.binding);
+      warnings.push(...(projectionResult.warnings ?? []));
+      if (projectionResult.failed.length > 0) {
+        return { ok: false, stage: "projection", errors: projectionResult.failed.map((f) => `Projection failed for ${f.effectiveId}: ${f.error}`) };
+      }
+    } catch (err) {
+      return { ok: false, stage: "projection", errors: [`Projection error: ${(err as Error).message}`] };
+    }
+
+    // 3. Partition startup files by concrete hint: pre-launch (filesystem) vs post-launch (TUI)
+    // Note: new file-building paths (NS-T05+) emit only concrete hints. The auto fallback
+    // is compatibility-only for pre-NS-T05 persisted startup contexts in node_startup_context.
+    //
+    // Rebuild-mode artifacts (when set) are merged in front of resolvedStartupFiles
+    // so the operator's trust-precedence ordering is preserved when the post-launch
+    // delivery loop walks the array. Rebuild artifacts are tagged
+    // appliesOn: ["fresh_start"] by the resolver, which matches the rebuild context.
+    const sourceFiles = input.rebuildArtifacts && input.rebuildArtifacts.length > 0
+      ? [...input.rebuildArtifacts, ...input.resolvedStartupFiles]
+      : input.resolvedStartupFiles;
+    // OPR.0.7.0.13 (router, R1.1): the one-line bootstrap is delivered on its own (below), only with a yes, and never
+    // stops the launch. Every start reads the answer, so a saved context from before the line was opt-in (or from while
+    // it was on) delivers it only while the yes stands. Nothing already written is removed.
+    const bootstrapLine = sourceFiles.filter((f) => f.appliesOn.includes(context) && !input.replaySkip?.files.has(f.absolutePath)
+      && isSeatSkillsBootstrapLine(f));
+    const applicableFiles = sourceFiles.filter((f) => f.appliesOn.includes(context) && !input.replaySkip?.files.has(f.absolutePath)
+      && !isSeatSkillsBootstrapLine(f));
+    const preLaunchFiles: ResolvedStartupFile[] = [];
+    const postLaunchFiles: ResolvedStartupFile[] = [];
+    for (const f of applicableFiles) {
+      const hint = f.deliveryHint === "auto"
+        ? resolveConcreteHint(f.path, this.safeReadFile(f.absolutePath), f.orientation)
+        : f.deliveryHint;
+      if (hint === "send_text") {
+        postLaunchFiles.push(f);
+      } else {
+        preLaunchFiles.push(f);
+      }
+    }
+
+    // 4. Deliver pre-launch files (filesystem: guidance_merge, skill_install)
+    // Always call even with empty list so adapters can provision runtime-specific config (e.g. context collectors)
+    try {
+      const deliveryResult = await input.adapter.deliverStartup(preLaunchFiles, input.binding);
+      warnings.push(...(deliveryResult.warnings ?? []));
+      if (deliveryResult.failed.length > 0) {
+        return { ok: false, stage: "pre_launch_files", errors: deliveryResult.failed.map((f) => `Pre-launch file delivery failed: ${f.path}: ${f.error}`) };
+      }
+    } catch (err) {
+      return { ok: false, stage: "pre_launch_files", errors: [`Pre-launch delivery error: ${(err as Error).message}`] };
+    }
+
+    // OPR.0.7.0.13 (router, R1.1): the bootstrap line, on its own: with a yes it is delivered into the seat's guidance file;
+    // otherwise it is skipped with the answer's reason. A line that can't be written is this start's named result (from
+    // the delivery's own error), never a failed launch.
+    let routerLine: RouterLineWriteResult | undefined;
+    if (bootstrapLine.length > 0) {
+      let answer: FootprintAnswer | null = null;
+      try { answer = readFootprintAnswer(this.readinessSettings); } catch { /* unreadable: reported as such */ }
+      const target = describeSkillRouterFootprint([{ seat: input.sessionName ?? input.nodeId, runtime: input.adapter.runtime,
+        cwd: input.binding.cwd ?? ".", claudeManagedBlockFile: input.binding.claudeManagedBlockFile ?? null }]).files[0]?.path;
+      if (target) {
+        const skip = routerLineSkipReason(answer);
+        if (skip) routerLine = { answer, files: [{ path: target, outcome: "skipped", reason: skip }] };
+        else if (guidanceFileIsLink(target)) {
+          // A linked guidance file is someone's layout, often a file outside the project: the line isn't written through it.
+          routerLine = { answer, files: [{ path: target, outcome: "linked" }] };
+          warnings.push(`seat_skills_line_linked: ${target} is a link, so the line wasn't written through it; the seat started without it`);
+        } else if (seatSkillsLineEdited(readGuidanceFile(target))) {
+          // Someone edited the line: a start leaves their block as it is, as rig down does.
+          routerLine = { answer, files: [{ path: target, outcome: "edited" }] };
+          warnings.push(`seat_skills_line_edited: ${target} holds an edited seat-skills line, so this start left it as it is`);
+        } else {
+          try {
+            // The saved line is optional, and the adapters swallow an optional file's write error; for this one isolated
+            // call, mark it required so the adapter reports the real error, which is handled here without failing the start.
+            const delivered = await input.adapter.deliverStartup(bootstrapLine.map((f) => ({ ...f, required: true })), input.binding);
+            const failed = delivered.failed.find((f) => f.path === bootstrapLine[0]!.path) ?? delivered.failed[0];
+            routerLine = { answer, files: [failed ? { path: target, outcome: "unwritable", error: failed.error } : { path: target, outcome: "delivered" }] };
+          } catch (err) {
+            routerLine = { answer, files: [{ path: target, outcome: "unwritable", error: (err as Error).message }] };
+          }
+          const unwritable = routerLine.files.find((f) => f.outcome === "unwritable");
+          if (unwritable && unwritable.outcome === "unwritable") warnings.push(`seat_skills_line_unwritable: ${unwritable.path}: ${unwritable.error}; the seat started without it`);
+        }
+      }
+    }
+
+    // OPR.0.7.0.13 (router): the seat's one generated router skill, after every pre-launch skill writer, so it lists
+    // every skill the seat starts with. A router that can't be written is this seat's named result; the launch goes on.
+    const routerSeatSkills = input.adapter.runtime === "claude-code" ? seatSkillPathsForNode(this.db, input.nodeId) : codexSeatSkills;
+    if (routerSeatSkills) {
+      try {
+        const router = writeSeatSkillRouter(routerSeatSkills);
+        if (router.kept) warnings.push(seatRouterKeptNote(router));
+      } catch (err) { warnings.push(`seat_router_not_written: ${(err as Error).message}`); }
+    }
+
+    // OPR.0.7.0.13 (Codex C2): the seat's catalog, built after every pre-launch skill writer (projection and startup
+    // skill files) and before the post-launch text that sends it, so it lists every skill the seat starts with.
+    if (codexSeatSkills) {
+      try {
+        const catalog = writeSeatSkillCatalog(codexSeatSkills);
+        if (catalog.kept) warnings.push(`${seatCatalogKeptNote(catalog)}${catalog.reason === "edited" ? ", and that file is what the seat's startup text sends" : ""}`);
+      } catch (err) { warnings.push(`seat skill catalog not written: ${(err as Error).message}`); }
+    }
+    return { ok: true, postLaunchFiles, ...(routerLine ? { routerLine } : {}) };
   }
 
   /** A failed attempt can continue only when it stopped before sending context, or when the runtime positively refused
