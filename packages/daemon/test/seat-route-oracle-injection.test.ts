@@ -22,7 +22,7 @@ vi.mock("../src/domain/seat-handover-service.js", () => ({
 
 import { seatRoutes } from "../src/routes/seat.js";
 
-function makeApp(sentinelOracle: object) {
+function makeApp(sentinelOracle: object, startupOrchestrator?: object) {
   const app = new Hono();
   app.use("*", async (c, next) => {
     c.set("rigRepo" as never, { db: {} } as never);
@@ -31,6 +31,7 @@ function makeApp(sentinelOracle: object) {
     c.set("eventBus" as never, {} as never);
     c.set("tmuxAdapter" as never, {} as never);
     c.set("seatActivityService" as never, sentinelOracle as never);
+    if (startupOrchestrator) c.set("startupOrchestrator" as never, startupOrchestrator as never);
     await next();
   });
   app.route("/api/seat", seatRoutes);
@@ -55,5 +56,29 @@ describe("Wave-O B1 — production handover construction injects the one activit
     expect(constructed).toHaveLength(1);
     // The R2 discriminator, preserved: candidate captured `undefined` here.
     expect(constructed[0]!.activityOracle).toBe(sentinel);
+  });
+});
+
+// A rebuild replays the seat's startup context through the daemon's orchestrator; without it the route would silently
+// fall back to priming the successor from its durable chain alone.
+describe("production handover construction injects the startup orchestrator", () => {
+  beforeEach(() => {
+    constructed.length = 0;
+    handover.mockClear();
+  });
+
+  it("constructs the service with the context's startupOrchestrator, and answers a startup_context_failed refusal with 409", async () => {
+    const orchestrator = { startNode: vi.fn() };
+    const app = makeApp({ declareOccupantSwap: vi.fn() }, orchestrator);
+    handover.mockResolvedValueOnce({ ok: false, code: "startup_context_failed", message: "malformed", guidance: "fix it" } as never);
+
+    const res = await app.request("/api/seat/handover/dev-impl%40seat-rig", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ reason: "new guidance", source: "rebuild" }),
+    });
+
+    expect(constructed[0]!.startupOrchestrator).toBe(orchestrator);
+    expect(res.status).toBe(409);
   });
 });

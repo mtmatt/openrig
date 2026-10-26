@@ -193,6 +193,8 @@ function handoverDeps(c: Context): ConstructorParameters<typeof SeatHandoverServ
       const topologyRoot = String(new SettingsStore().resolveOne("topology.root").value);
       return resolveAuthoredRecapPointer(seatRef, topologyRoot);
     },
+    // A rebuilt successor gets the seat's startup context (identity, role, guidance) as a fresh launch does.
+    startupOrchestrator: (c.get("startupOrchestrator" as never) as import("../domain/startup-orchestrator.js").StartupOrchestrator | undefined) ?? undefined,
     // OPR.0.5.5.5 (fix B3) — the ONE production rebuild priming chain builder
     // (rebuild-priming-chain.ts): RECAP.md, LEARNED.md, latest restore packet
     // when the seat's restore-pending marker names one, superseded recaps
@@ -324,7 +326,8 @@ seatRoutes.post("/handover/:seatRef", async (c) => {
     result.code === "successor_tmux_absent" ||
     result.code === "successor_already_managed" ||
     result.code === "successor_is_current" ||
-    result.code === "runtime_mismatch") {
+    result.code === "runtime_mismatch" ||
+    result.code === "startup_context_failed") {
     return c.json(result, 409);
   }
   if (result.code === "seat_ref_required") {

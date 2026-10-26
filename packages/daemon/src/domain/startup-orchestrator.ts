@@ -347,10 +347,10 @@ export class StartupOrchestrator {
     // OPR.0.7.0.13 (Codex C2): a Codex seat's own storage, looked up once: its skills go there, and its catalog, rebuilt
     // there after this launch's projection, is what its per-seat startup text delivers.
     const codexSeatSkills = input.adapter.runtime === "codex" ? seatSkillPathsForNode(this.db, input.nodeId) : undefined;
-    // #25: launch, restore replay, relaunch, continue and added members deliver
-    // guidance through here, so the rig's managed-block destination is bound once
-    // for the adapter. Handover does not come here: the successor launches directly
-    // and reads the file already written in its cwd.
+    // #25: launch, restore replay, relaunch, continue, added members and a rebuild
+    // handover's successor deliver guidance through here, so the rig's managed-block
+    // destination is bound once for the adapter. Fresh and fork handovers do not come
+    // here: their successor launches directly and reads the file already written in its cwd.
     input = { ...input, binding: this.withDeliverySettings(input, codexSeatSkills) };
     // OPR.0.7.0.9: a Claude seat's own launch additions, the copies present in its seat storage; a missing copy is named.
     if (input.adapter.runtime === "claude-code" && !input.binding.launchAdditions) {
@@ -817,6 +817,30 @@ export class StartupOrchestrator {
     this.eventBus.emit({ type: "node.startup_ready", rigId: input.rigId, nodeId: input.nodeId, ...(submission ? { submission } : {}) });
 
     return { ok: true, startupStatus: "ready", continuityOutcome, ...(submission ? { submission } : {}), ...(routerLine ? { routerLine } : {}), ...(resumedProcess ? { resumedProcess } : {}) };
+  }
+
+  /**
+   * The filesystem part of a fresh start, for a harness that another path launches: the binding gets the seat's
+   * permission selection and delivery settings, then the plan's resources are projected and the pre-launch startup files
+   * written (guidance merged into the managed block, skills installed, the seat-skills line, router and catalog), as
+   * startNode does before it launches a harness. A rebuild handover calls this before its successor starts, so the
+   * successor reads the seat's current guidance; the startNode that later finishes the successor's startup repeats these
+   * writes. No startup status or event is recorded.
+   */
+  async deliverPreLaunchFiles(
+    input: Pick<StartupInput, "rigId" | "nodeId" | "sessionName" | "binding" | "adapter" | "plan" | "resolvedStartupFiles">,
+  ): Promise<{ ok: true; warnings: string[] } | { ok: false; errors: string[] }> {
+    let binding: NodeBinding;
+    try {
+      binding = new NativePermissionStore(this.db).apply(input.binding, input.adapter.runtime);
+    } catch (error) {
+      return { ok: false, errors: [`Permission selection: ${(error as Error).message}`] };
+    }
+    const codexSeatSkills = input.adapter.runtime === "codex" ? seatSkillPathsForNode(this.db, input.nodeId) : undefined;
+    binding = this.withDeliverySettings({ ...input, binding }, codexSeatSkills);
+    const warnings: string[] = [];
+    const delivered = await this.deliverFilesystemStartup({ ...input, binding }, "fresh_start", codexSeatSkills, warnings);
+    return delivered.ok ? { ok: true, warnings } : { ok: false, errors: delivered.errors };
   }
 
   /**

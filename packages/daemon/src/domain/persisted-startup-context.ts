@@ -8,8 +8,9 @@ import { reanchorBuiltinStartupFile, reanchorShippedProjectionEntry } from "./bu
 
 /**
  * The startup context a seat's last managed start persisted (node_startup_context), parsed back into the shape
- * StartupOrchestrator.startNode takes. A fresh launch and a continued startup replay it, so the seat starts from its own
- * configured startup files and actions, read from their paths at delivery time; set-cwd and a runtime switch read it too.
+ * StartupOrchestrator.startNode takes. A fresh launch, a continued startup and a rebuild handover replay it, so the seat
+ * starts from its own configured startup files and actions, read from their paths at delivery time; set-cwd and a runtime
+ * switch read it too.
  */
 export interface ParsedStartupContext {
   plan: ProjectionPlan;

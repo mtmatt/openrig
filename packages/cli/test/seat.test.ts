@@ -733,6 +733,64 @@ describe("rig seat status", () => {
     expect(output).not.toContain("No conversation continuity, startup context delivery,");
   });
 
+  it.each([
+    ["ready", { startup: { status: "ready" }, sideEffects: { ...HANDOVER_RESULT.sideEffects, startupContextDelivered: true } },
+      "The seat's startup context (identity, role, guidance) was delivered to the successor as a fresh launch delivers it.", undefined],
+    ["attention_required", { startup: { status: "attention_required", continuable: true, detail: "native gate; After resolving it in dev-impl@seat-rig, run: rig seat continue dev-impl@seat-rig" },
+      primingNotDelivered: "the successor's startup did not finish" }, "finish the startup with `rig seat continue dev-impl@seat-rig`", 1],
+    ["attention_required, nothing to continue", { startup: { status: "attention_required", continuable: false, detail: "provider gate after context delivery" },
+      primingNotDelivered: "the successor's startup did not finish" }, "resolve what the detail above names in the successor's pane; if its startup context wasn't read, relaunch with `rig seat launch dev-impl@seat-rig --fresh --stop --reason <text>`. Then tell the seat it was rebuilt", 1],
+    ["failed", { startup: { status: "failed", continuable: false, detail: "Pre-launch file delivery failed: CULTURE.md: EACCES" },
+      primingNotDelivered: "the successor's startup did not finish" }, "this startup can't be continued; relaunch with `rig seat launch dev-impl@seat-rig --fresh --stop --reason <text>`", 1],
+  ])("rebuild handover reports its startup context (%s)", async (_status, outcome, line, expectedExit) => {
+    const deps = makeDeps({ status: 200, data: { ...HANDOVER_RESULT, source: { mode: "rebuild", ref: null, raw: "rebuild", defaulted: false }, ...outcome } }, []);
+
+    const { logs, exitCode } = await captureLogs(async () => {
+      await makeCommand(deps).parseAsync(["node", "rig", "seat", "handover", "dev-impl@seat-rig", "--source", "rebuild", "--reason", "new guidance"]);
+    });
+
+    expect(logs.join("\n")).toContain(line);
+    expect(exitCode).toBe(expectedExit);
+  });
+
+  it("rebuild handover whose startup prompt still waits for Enter says so instead of calling it delivered, and exits 1", async () => {
+    const deps = makeDeps({ status: 200, data: { ...HANDOVER_RESULT,
+      source: { mode: "rebuild", ref: null, raw: "rebuild", defaulted: false },
+      sourceOutcome: { mode: "rebuild", primedArtifacts: [{ address: "/seats/dev-impl/RECAP.md", label: "authored recap" }], gaps: [] },
+      startup: { status: "ready", staged: true, detail: "Startup prompt still staged in dev-impl@seat-rig; press Enter in that pane." },
+      primingNotDelivered: "the successor's startup prompt is still waiting in its composer, so the priming was not typed after it" } }, []);
+
+    const { logs, exitCode } = await captureLogs(async () => {
+      await makeCommand(deps).parseAsync(["node", "rig", "seat", "handover", "dev-impl@seat-rig", "--source", "rebuild", "--reason", "new guidance"]);
+    });
+
+    const output = logs.join("\n");
+    expect(output).toContain("The seat's startup context (identity, role, guidance) was typed into the successor and is waiting for Enter: Startup prompt still staged in dev-impl@seat-rig; press Enter in that pane.");
+    expect(output).not.toContain("was delivered to the successor as a fresh launch delivers it");
+    expect(output).toContain("Next: press Enter in the successor's pane to submit its startup prompt, then point the seat at the priming set listed above.");
+    expect(exitCode).toBe(1);
+  });
+
+  it.each([[[]], [["--json"]]])("rebuild handover with an undelivered priming set says so and exits 1 (%j)", async (extraArgs) => {
+    const deps = makeDeps({ status: 200, data: { ...HANDOVER_RESULT,
+      source: { mode: "rebuild", ref: null, raw: "rebuild", defaulted: false },
+      sourceOutcome: { mode: "rebuild", primedArtifacts: [{ address: "/seats/dev-impl/RECAP.md", label: "authored recap" }], gaps: [] },
+      startup: { status: "ready" },
+      primingNotDelivered: "tmux refused the paste" } }, []);
+
+    const { logs, exitCode } = await captureLogs(async () => {
+      await makeCommand(deps).parseAsync(["node", "rig", "seat", "handover", "dev-impl@seat-rig", "--source", "rebuild", "--reason", "new guidance", ...extraArgs]);
+    });
+
+    const output = logs.join("\n");
+    if (extraArgs.length === 0) {
+      expect(output).toContain("Rebuild priming set of 1 durable artifact (NOT delivered; see below):");
+      expect(output).not.toContain("Rebuild primed from");
+      expect(output).toContain("Next: once the successor has answered its startup prompt, point the seat at the priming set listed above.");
+    }
+    expect(exitCode).toBe(1);
+  });
+
   it("handover surfaces a loud step-named failure (successor_create_failed)", async () => {
     const deps = makeDeps({
       status: 500,

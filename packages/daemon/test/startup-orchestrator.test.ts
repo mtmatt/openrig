@@ -2422,4 +2422,70 @@ describe("StartupOrchestrator", () => {
     expect(deliveredFiles).toContain("guidance/role.md");
     expect(deliveredFiles).toContain("openrig-start.md");
   });
+
+  describe("deliverPreLaunchFiles", () => {
+    const file = (path: string, deliveryHint: ResolvedStartupFile["deliveryHint"], appliesOn: ResolvedStartupFile["appliesOn"] = ["fresh_start", "restore"]): ResolvedStartupFile =>
+      ({ path, absolutePath: `/spec/${path}`, ownerRoot: "/spec", deliveryHint, required: true, appliesOn });
+    const startupEvents = () => (db.prepare("SELECT type FROM events WHERE type LIKE 'node.startup_%'").all() as Array<{ type: string }>).map((row) => row.type);
+
+    it("delivers a fresh start's filesystem files through the rig's managed-block destination, recording no startup state", async () => {
+      const seed = seedSession();
+      rigRepo.setRigClaudeManagedBlockFile(seed.rigId, "CLAUDE.local.md");
+      const adapter = mockAdapter();
+      const culture = file("CULTURE.md", "guidance_merge");
+      const skill = file("skills/review/SKILL.md", "skill_install");
+
+      const result = await createOrchestrator().deliverPreLaunchFiles({
+        rigId: seed.rigId, nodeId: seed.nodeId, binding: makeBinding(), adapter, plan: emptyPlan(),
+        resolvedStartupFiles: [file("guidance/role.md", "send_text"), culture, file("restore-only.md", "guidance_merge", ["restore"]), skill],
+      });
+
+      expect(result).toEqual({ ok: true, warnings: [] });
+      expect(adapter.project).toHaveBeenCalledWith(emptyPlan(), expect.objectContaining({ claudeManagedBlockFile: "CLAUDE.local.md" }));
+      expect(adapter.deliverStartup).toHaveBeenCalledTimes(1);
+      expect(adapter.deliverStartup).toHaveBeenCalledWith([culture, skill], expect.objectContaining({ claudeManagedBlockFile: "CLAUDE.local.md" }));
+      expect(adapter.launchHarness).not.toHaveBeenCalled();
+      expect(startupEvents()).toEqual([]);
+      expect(sessionRegistry.getSessionsForRig(seed.rigId)[0]?.startupStatus).toBe("pending");
+    });
+
+    it("installs a seat's skills in its own storage, as a launch does, never in the project", async () => {
+      const savedHome = process.env["OPENRIG_HOME"];
+      const home = nodeFs.mkdtempSync(nodePath.join(nodeOs.tmpdir(), "prelaunch-seat-home-"));
+      process.env["OPENRIG_HOME"] = home;
+      try {
+        const seed = seedSession();
+        const { logical_id: logicalId } = db.prepare("SELECT logical_id FROM nodes WHERE id = ?").get(seed.nodeId) as { logical_id: string };
+        const paths = seatSkillPaths({ rigId: seed.rigId, logicalId, runtime: "claude-code" });
+        nodeFs.mkdirSync(nodePath.dirname(paths.pluginManifestPath), { recursive: true });
+        nodeFs.writeFileSync(paths.pluginManifestPath, "{\"name\":\"openrig\"}\n");
+        const adapter = mockAdapter();
+        const skill = file("skills/review/SKILL.md", "skill_install");
+
+        const result = await createOrchestrator().deliverPreLaunchFiles({
+          rigId: seed.rigId, nodeId: seed.nodeId, binding: makeBinding(), adapter, plan: emptyPlan(), resolvedStartupFiles: [skill],
+        });
+
+        expect(result).toMatchObject({ ok: true });
+        expect(adapter.deliverStartup).toHaveBeenCalledWith([skill], expect.objectContaining({ seatSkillsRoot: paths.skillsRoot }));
+      } finally {
+        if (savedHome === undefined) delete process.env["OPENRIG_HOME"]; else process.env["OPENRIG_HOME"] = savedHome;
+        nodeFs.rmSync(home, { recursive: true, force: true });
+      }
+    });
+
+    it.each([
+      ["projection", { project: vi.fn(async () => ({ projected: [], skipped: [], failed: [{ effectiveId: "core", error: "unwritable" }] })) }, "Projection failed for core: unwritable"],
+      ["file delivery", { deliverStartup: vi.fn(async () => ({ delivered: 0, failed: [{ path: "CULTURE.md", error: "ENOENT" }] })) }, "Pre-launch file delivery failed: CULTURE.md: ENOENT"],
+    ])("returns the errors of a failed %s", async (_stage, overrides, error) => {
+      const seed = seedSession();
+
+      const result = await createOrchestrator().deliverPreLaunchFiles({
+        rigId: seed.rigId, nodeId: seed.nodeId, binding: makeBinding(), adapter: mockAdapter(overrides), plan: emptyPlan(), resolvedStartupFiles: [file("CULTURE.md", "guidance_merge")],
+      });
+
+      expect(result).toEqual({ ok: false, errors: [error] });
+      expect(startupEvents()).toEqual([]);
+    });
+  });
 });
